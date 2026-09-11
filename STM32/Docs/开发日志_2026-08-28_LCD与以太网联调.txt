@@ -1,0 +1,15 @@
+﻿8月28日
+
+2026.8.28 开发日志
+
+今天首先继续检查了远程 FPGA 平台的 FMC 通信方案。STM32 的 FMC 数据线由 SDRAM 和 Lattice 复用，地址线不复用，通过不同片选区分访问对象。确认访问 SDRAM 时不需要 Lattice 返回应答，但 Lattice 在未被片选时必须将 FMC_DB[15:0] 全部释放为高阻态；只有 Lattice 片选有效并且 NOE 或 NWE 满足读写条件时，才能采样或驱动数据总线。原工程中共享数据脚固定输出以及 DB15 输出时钟都会造成总线争用，因此在新的 Lattice 工程中将 16 位数据总线改为真正的双向三态总线，并将工程迁移到 D:\FPGA_prj\lattice_fmc16_link_complete，避免 Diamond 无法正确识别中文工程路径的问题。
+
+随后继续排查 STM32 LCD 不显示的问题。拆除和装回过桥板均没有效果，给 STM32 烧录此前已经验证通过的 v7_h743、DSO 和 STM32H743_XC7A100_PS_Configuration 工程后，LCD 仍然不亮。更换 STM32 核心板后，上述几个工程全部恢复正常，由此确认之前的问题来自旧核心板硬件故障，而不是 LCD 驱动、Lattice 或过桥板。后续调试均使用更换后的核心板进行。
+
+在硬件恢复正常后，重新整理了 D:\CubeMX\STM32_ETH_M0_Demo 工程的 LCD 部分。将已验证的 bsp_lcd_rgb.c 和 bsp_lcd_rgb.h 移入该工程，统一使用 PH6 作为 LCD CS、PH7 作为 SCK、PH8 作为 SDA、PB14 控制背光，显示分辨率为 480×800，像素格式为 RGB565，帧缓冲地址为 0xC0200000。SDRAM、FMC、LTDC 时序、PLL3、GPIO 和 MPU 配置均与正常工程进行了逐项对比。
+
+第一次移植后工程能够编译，但 LCD 仍然不亮。继续对比 v7_h743 和 STM32H743_XC7A100_PS_Configuration 后发现，正常工程会在 MX_LTDC_Init 内部、LTDC 开始输出像素时钟和 RGB 信号之前执行 LCD_RGB_InitPanelOnly，而新工程原先在 MX_LTDC_Init 完成后才配置面板寄存器。将面板初始化恢复到正确顺序后，同时使用 Cortex-M7 的 DWT 周期计数器产生精确微秒延时，显式使能 LTDC Layer1，并校正 CFBAR 为 0xC0200000。最终工程编译结果为 0 个错误、0 个警告，烧录并重新上电后 LCD 已经能够正常显示 M0 Ethernet Demo 页面。
+
+之后检查了工程中的以太网发送流程。该工程使用 FreeRTOS 和 LwIP，只运行一个以太网任务，STM32 使用静态地址 192.168.100.50，子网掩码为 255.255.255.0，网关为 192.168.100.1，并通过 UDP 向 192.168.100.100 的 5005 端口发送数据。程序每隔 100 ms 生成一次 M0 实验遥测信息，将实验名称、序号、时间戳、模式、时钟档位、PI、PO 和 PIO 等字段整理为 JSON 后发送。LCD 会显示 WAIT LINK、LINK UP、SEND OK 或 SEND ERROR，用于观察物理链路和发送状态。电脑端只需将有线网卡配置为 192.168.100.100，并监听 UDP 5005 端口即可接收数据。
+
+当前以太网链路发送的数据仍由 m0_data_source.c 模拟生成，source 字段为 mock，还没有读取 Lattice 的真实 FMC 寄存器。下一步将在现有 UDP JSON 格式不变的基础上，把 M0_DataSource_Read 中的模拟数据替换为 FMC 实际解析结果，并补充设备 ID、版本、总线超时和错误计数，最终完成 Lattice 状态采集、STM32 LCD 显示和服务器数字孪生上传的完整链路。

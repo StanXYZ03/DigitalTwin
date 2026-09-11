@@ -1,0 +1,46 @@
+﻿FMC16 M0 精简版 Lattice 工程说明
+
+工程目录：D:\FPGA_prj\lattice_fmc16_m0_minimal
+器件：LCMXO2-4000HC-4TG144C
+顶层：fmc16_link_test_top
+可烧录文件：D:\FPGA_prj\lattice_fmc16_m0_minimal\FMC16_M0_MINIMAL_READY_TO_PROGRAM.jed
+SHA256：E9E146FE338A7B0418FA4BE2B6D419059095F51D133C2D5C924CE03974F3196A
+
+本版本用途
+1. 保留已经验证过的 mini FMC16 异步物理层和 packet/CRC 协议。
+2. 固定为 M0 实验，不包含主工程中导致资源超限的 13 模式、多级缓存、事件队列和通用事务引擎。
+3. 稳定采样实验 FPGA 的 PO[31:0] 和 PIO[15:0]。
+4. Lattice 对全部 PIO 始终输出高阻，仅观察实验 FPGA 的 PIO，不与其争用。
+5. 八位数码管显示 PO[31:0]；12 个 LED 显示 PIO[11:0] 的反相值，与主工程 M0 行为一致。
+6. Lattice 仅在 NE1 有效且 NOE 有效的 FMC 读周期驱动 FMC_DB[15:0]；访问 SDRAM或 FMC 写周期时全部高阻。
+
+FMC packet 支持
+上电发送：RESET_NOTICE -> LINK_HELLO -> DEVICE_INFO。
+命令 0x0001：GET_CAPABILITIES。
+命令 0x0003：GET_STATUS_SNAPSHOT。
+0x0003 RESPONSE 的 payload 共 14 words：
+P0 opcode=0x0003
+P1 status=0
+P2 detail=0
+P3 result_words=10
+P4 schema=0x0100
+P5 validity：bit0=本地数据有效，bit1=PO 连续采样一致，bit2=PIO 连续采样一致，bit8=FMC_CLK 采样电平，bit9=FMC_NWAIT 采样电平
+P6-P8 固定 M0 的兼容控制字段，当前均为 0
+P9 PO[31:16]
+P10 PO[15:0]
+P11 PIO[15:0]
+P12 timestamp_ms[31:16]
+P13 timestamp_ms[15:0]
+
+构建与验证结果
+ModelSim RTL 编译：0 error，0 warning。
+M0 数据面仿真：通过 PO/PIO 稳定采样、PIO 高阻、LED 映射、数码管数据和 FMC 空闲/写周期 DB 高阻检查。
+Diamond 3.14：综合、映射、布局布线、时序分析和 JEDEC 生成全部成功。
+资源：1628 LUT4 / 4320（38%），1323 registers / 4665（28%），PIO 99+JTAGENB / 115（87%）。
+时序：50 MHz 约束通过，报告最大频率 57.045 MHz，setup/hold timing score 均为 0。
+资源报告：D:\FPGA_prj\lattice_fmc16_m0_minimal\impl_fmc16_link_test\X024000HC_FMC16_LINK_TEST_impl_link_test.mrp
+时序报告：D:\FPGA_prj\lattice_fmc16_m0_minimal\impl_fmc16_link_test\X024000HC_FMC16_LINK_TEST_impl_link_test.twr
+
+烧录注意
+该位流设置 JTAG_PORT=DISABLE，配置后复用 JTAG 脚作为 FMC 用户 IO。烧录时必须按当前硬件方法使 120 脚 JTAGENB 为高，并在必要时拆下过桥板；烧录完成后再按实验连接要求装回过桥板。
+STM32 目前若仍使用 mock M0 数据源，还需要在 STM32 工程中加入 0x0003 命令收发和 RESPONSE 解析，LCD/以太网数据才会来自真实 PO/PIO。

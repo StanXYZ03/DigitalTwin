@@ -1,0 +1,51 @@
+# Operating-system and editor files
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Local configuration and dependencies
+.env
+.env.*
+!.env.example
+node_modules/
+
+# Logs, locks, archives and temporary files
+*.log
+*.lock
+*.tmp
+*.bak
+*.zip
+*.exe
+transcript
+*.backup.*
+*_backup.*
+
+# Keil/ArmCC generated files
+STM32/.keil_temp/
+STM32/MDK-ARM/BuildTemp/
+STM32/MDK-ARM/FMC16_LINK_TEST_BUILD/
+STM32/MDK-ARM/FMC16_LINK_TEST_CLEAN/
+STM32/MDK-ARM/STM32H743_XC7A100_PS_Configuration/
+STM32/MDK-ARM/*.uvguix.*
+STM32/MDK-ARM/*.uvoptx
+*.o
+*.d
+*.crf
+*.lst
+*.map
+*.axf
+*.hex
+*.lnp
+*.dep
+*.iex
+*.build_log.htm
+
+# Diamond generated implementation and programming outputs
+Lattice/lattice_fmc16_m0_platform/impl_fmc16_link_test/
+Lattice/lattice_fmc16_m0_platform/temp/
+Lattice/lattice_fmc16_m0_platform/work/
+Lattice/lattice_fmc16_m0_platform/*.jed
+Lattice/lattice_fmc16_m0_platform/*.jed.*
+Lattice/lattice_fmc16_m0_platform/*.pre_*.v
+Lattice/lattice_fmc16_m0_platform/*.prefetch_*.v
