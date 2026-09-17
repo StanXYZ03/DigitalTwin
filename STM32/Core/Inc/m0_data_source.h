@@ -76,6 +76,8 @@ typedef struct
     uint16_t pi_virtual_toggle;
     uint16_t virtual_key_state;
     uint16_t virtual_key_count;
+    uint32_t mode_set_count;
+    uint32_t mode_set_error_count;
     uint32_t last_control_id;
     uint32_t control_duplicate_count;
     uint32_t control_reject_count;
@@ -87,6 +89,14 @@ typedef struct
     uint32_t bridge_enable_count;
     uint32_t bridge_gpioh_odr;
     uint32_t bridge_settle_cycles;
+    uint32_t matrix_diag_samples;
+    uint32_t matrix_diag_changes;
+    uint16_t matrix_rows;
+    uint8_t matrix_col;
+    uint8_t matrix_scan_heartbeat;
+    uint8_t matrix_previous_heartbeat;
+    uint8_t current_mode;
+    uint8_t requested_mode;
 } M0_FmcDebug;
 
 extern volatile M0_FmcDebug m0_fmc_dbg;
@@ -96,6 +106,7 @@ uint8_t M0_DataSource_Read(M0_DataSnapshot *snapshot);
 int32_t M0_DataSource_VirtualKeySet(uint8_t f_number,
                                    uint8_t pressed,
                                    uint32_t command_id);
+int32_t M0_DataSource_SetMode(uint8_t mode);
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,8 @@
 'use strict';
 const assert = require('assert');
-const { ControlQueue, TwinStore, buildControlFrame, crc16Ccitt,
-  displayModel, isNewer32 } = require('./server');
+const { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
+  buildPanelControlFrame, crc16Ccitt,
+  displayModel, isNewer32, validateModuleData } = require('./server');
 
 function packet(sequence=1, timestamp_ms=100, po=0, pio=0) {
   return { type:'telemetry', experiment:'exp2-01_hex_counter_32', source:'fmc16',
@@ -27,6 +28,24 @@ assert.strictEqual(s.snapshot(4101).po,0);
 assert.strictEqual(s.accept(packet(1,1,5,2),'192.168.100.50',4200).accepted,true);
 assert.strictEqual(s.snapshot(4200).deviceEpoch,1);
 assert.strictEqual(s.accept(packet(2),'10.0.0.1',4300).reason,'sourceIp');
+assert.strictEqual(s.accept({...packet(2),mode:12},'192.168.100.50',4300).reason,'identity');
+assert.strictEqual(s.accept({...packet(2),mode:1},'192.168.100.50',4300).reason,'identity');
+const modulePacket={ver:'1.0',type:'module.data',module:'ina226_u44',seq:1,
+  ts_ms:4200,data:{cur_ma:103,over_cur:0,valid:1,level:0}};
+assert.strictEqual(validateModuleData(modulePacket,'192.168.100.50'),modulePacket);
+assert.strictEqual(s.acceptModule(modulePacket,'192.168.100.50',4300).accepted,true);
+assert.strictEqual(s.snapshot(4300).modules.ina226_u44.data.cur_ma,103);
+assert.strictEqual(s.acceptModule(modulePacket,'192.168.100.50',4400).reason,'duplicate');
+assert.strictEqual(s.acceptModule({...modulePacket,module:'watchdog',seq:2},
+  '192.168.100.50',4500).reason,'identity');
+const panelPacket={ver:'1.0',type:'module.data',module:'pcal6524',seq:2,
+  ts_ms:4500,data:{sw:0x1001,yds:0x06,eth_link:1,usb_active:0,
+    buzzer_mute:0,alarm_level:0,valid:1,last_result:0}};
+assert.strictEqual(validateModuleData(panelPacket,'192.168.100.50'),panelPacket);
+assert.strictEqual(s.acceptModule(panelPacket,'192.168.100.50',4500).accepted,true);
+assert.strictEqual(s.snapshot(4500).modules.pcal6524.data.sw,0x1001);
+assert.throws(()=>validateModuleData({...panelPacket,data:{...panelPacket.data,sw:0x200}},
+  '192.168.100.50'),/data/);
 
 const frame=buildControlFrame(2,'down',0x12345678);
 assert.strictEqual(frame.length,16);
@@ -40,6 +59,22 @@ assert.strictEqual(frame.readUInt16BE(14),crc16Ccitt(frame,14));
 assert.throws(()=>buildControlFrame(11,'down',1),/key/);
 assert.throws(()=>buildControlFrame(2,'hold',1),/action/);
 assert.throws(()=>buildControlFrame(2,'down',0),/commandId/);
+const panelFrame=buildPanelControlFrame('switch',14,1,0x10203040);
+assert.strictEqual(panelFrame.length,16);
+assert.strictEqual(panelFrame.subarray(0,4).toString('ascii'),'M0PC');
+assert.strictEqual(panelFrame[5],1);
+assert.strictEqual(panelFrame[6],14);
+assert.strictEqual(panelFrame[7],1);
+assert.strictEqual(panelFrame.readUInt32BE(8),0x10203040);
+assert.strictEqual(panelFrame.readUInt16BE(14),crc16Ccitt(panelFrame,14));
+assert.throws(()=>buildPanelControlFrame('switch',10,1,1),/switch/);
+const modeFrame=buildPanelControlFrame('mode',11,0,0x10203041);
+assert.strictEqual(modeFrame[5],3);
+assert.strictEqual(modeFrame[6],11);
+assert.strictEqual(modeFrame[7],0);
+assert.throws(()=>buildPanelControlFrame('mode',12,0,1),/mode/);
+assert.throws(()=>buildPanelControlFrame('mode',1,0,1),/mode/);
+assert.throws(()=>buildPanelControlFrame('mode',1,1,1),/mode/);
 
 const sent=[];
 const q=new ControlQueue(value=>sent.push(Buffer.from(value)),()=>{},100);
@@ -54,4 +89,11 @@ assert.strictEqual(q.acknowledge(99,1300),false);
 assert.strictEqual(q.acknowledge(100,1300),true);
 assert.strictEqual(q.view().status,'acknowledged');
 assert.strictEqual(q.enqueue(10,'up',1400).action,'up');
+const panelSent=[];
+const pq=new PanelControlQueue(value=>panelSent.push(Buffer.from(value)),()=>{},200);
+assert.strictEqual(pq.enqueue('buzzer',0,1,2000).id,200);
+assert.strictEqual(panelSent[0][5],2);
+assert.strictEqual(pq.acknowledge(200,2100),true);
+assert.strictEqual(pq.enqueue('mode',11,0,2200).target,'mode');
+assert.strictEqual(panelSent[1][5],3);
 console.log('Digital twin tests: ALL PASS');

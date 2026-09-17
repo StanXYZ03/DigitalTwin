@@ -3,6 +3,8 @@
 #include "lcd_status.h"
 #include "bsp_lcd_rgb.h"
 #include "m0_data_source.h"
+#include "board_monitor.h"
+#include "board_panel.h"
 #include "gpio.h"
 #include "fpga_autoconfig.h"
 #include "cmsis_os.h"
@@ -22,6 +24,10 @@ extern struct netif gnetif;
 #define ETH_CONTROL_VERSION       1U
 #define ETH_CONTROL_ACTION_DOWN   1U
 #define ETH_CONTROL_ACTION_UP     2U
+#define ETH_PANEL_TARGET_SWITCH   1U
+#define ETH_PANEL_TARGET_BUZZER   2U
+#define ETH_PANEL_TARGET_MODE     3U
+#define ETH_ENVIRONMENT_PERIOD_MS 1000U
 
 typedef struct
 {
@@ -31,6 +37,9 @@ typedef struct
     uint32_t send_count;
     uint32_t send_error_count;
     uint32_t fmc_read_error_count;
+    uint32_t environment_send_count;
+    uint32_t environment_send_error_count;
+    uint32_t last_environment_sequence;
     uint32_t last_payload_len;
     uint32_t last_sequence;
     uint32_t last_po;
@@ -240,6 +249,8 @@ static void ETH_PollControl(int sock,
     uint16_t expected_crc;
     int32_t result;
     uint32_t packet_index;
+    uint8_t is_key;
+    uint8_t is_panel;
 
     for (packet_index = 0U; packet_index < 8U; ++packet_index)
     {
@@ -260,16 +271,22 @@ static void ETH_PollControl(int sock,
         eth_task_dbg.control_rx_count++;
         if ((received != (int)ETH_CONTROL_PACKET_BYTES) ||
             (remote_addr.sin_addr.s_addr != server_addr->sin_addr.s_addr) ||
-            (remote_addr.sin_port != server_addr->sin_port) ||
-            (packet[0] != (uint8_t)'M') ||
-            (packet[1] != (uint8_t)'0') ||
-            (packet[2] != (uint8_t)'K') ||
-            (packet[3] != (uint8_t)'C') ||
+            (remote_addr.sin_port != server_addr->sin_port))
+        {
+            eth_task_dbg.control_reject_count++;
+            continue;
+        }
+        is_key = ((packet[0] == (uint8_t)'M') &&
+                  (packet[1] == (uint8_t)'0') &&
+                  (packet[2] == (uint8_t)'K') &&
+                  (packet[3] == (uint8_t)'C')) ? 1U : 0U;
+        is_panel = ((packet[0] == (uint8_t)'M') &&
+                    (packet[1] == (uint8_t)'0') &&
+                    (packet[2] == (uint8_t)'P') &&
+                    (packet[3] == (uint8_t)'C')) ? 1U : 0U;
+        if (((is_key == 0U) && (is_panel == 0U)) ||
             (packet[4] != ETH_CONTROL_VERSION) ||
-            (packet[5] < 1U) || (packet[5] > 10U) ||
-            ((packet[6] != ETH_CONTROL_ACTION_DOWN) &&
-             (packet[6] != ETH_CONTROL_ACTION_UP)) ||
-            (packet[7] != 0U))
+            (packet[12] != 0U) || (packet[13] != 0U))
         {
             eth_task_dbg.control_reject_count++;
             continue;
@@ -289,10 +306,56 @@ static void ETH_PollControl(int sock,
                      ((uint32_t)packet[9] << 16) |
                      ((uint32_t)packet[10] << 8) |
                      (uint32_t)packet[11];
-        result = M0_DataSource_VirtualKeySet(
-            packet[5],
-            (packet[6] == ETH_CONTROL_ACTION_DOWN) ? 1U : 0U,
-            command_id);
+        if (is_key != 0U)
+        {
+            if ((packet[5] < 1U) || (packet[5] > 10U) ||
+                ((packet[6] != ETH_CONTROL_ACTION_DOWN) &&
+                 (packet[6] != ETH_CONTROL_ACTION_UP)) ||
+                (packet[7] != 0U))
+            {
+                eth_task_dbg.control_reject_count++;
+                continue;
+            }
+            if ((packet[5] == 10U) &&
+                (packet[6] == ETH_CONTROL_ACTION_DOWN))
+            {
+                uint8_t next_mode;
+                int32_t mode_result;
+
+                next_mode = (m0_fmc_dbg.current_mode == 0U) ? 11U : 0U;
+                mode_result = BoardPanel_SetMode(next_mode, command_id);
+                result = (mode_result >= 0) ?
+                    M0_DataSource_VirtualKeySet(10U, 1U, command_id) :
+                    mode_result;
+            }
+            else
+            {
+                result = M0_DataSource_VirtualKeySet(
+                    packet[5],
+                    (packet[6] == ETH_CONTROL_ACTION_DOWN) ? 1U : 0U,
+                    command_id);
+            }
+        }
+        else if ((packet[5] == ETH_PANEL_TARGET_SWITCH) &&
+                 (packet[7] <= 1U))
+        {
+            result = BoardPanel_SetSwitch(packet[6], packet[7], command_id);
+        }
+        else if ((packet[5] == ETH_PANEL_TARGET_BUZZER) &&
+                 (packet[6] == 0U) && (packet[7] <= 1U))
+        {
+            result = BoardPanel_SetBuzzerMute(packet[7], command_id);
+        }
+        else if ((packet[5] == ETH_PANEL_TARGET_MODE) &&
+                 ((packet[6] == 0U) || (packet[6] == 11U)) &&
+                 (packet[7] == 0U))
+        {
+            result = BoardPanel_SetMode(packet[6], command_id);
+        }
+        else
+        {
+            result = -1;
+        }
         if (result == 0)
         {
             eth_task_dbg.control_accept_count++;
@@ -329,18 +392,31 @@ static int ETH_FormatM0Payload(const M0_DataSnapshot *snapshot,
                                char *payload,
                                size_t payload_size)
 {
+    BoardPanelSnapshot panel;
+    uint32_t panel_ack = 0U;
+    const char *experiment;
+
+    if (BoardPanel_GetSnapshot(&panel) != 0U)
+    {
+        panel_ack = panel.control_ack;
+    }
+    experiment = (snapshot->mode == 11U) ?
+                 "exp3-04_dot_matrix_led" :
+                 "exp2-01_hex_counter_32";
     return snprintf(
         payload,
         payload_size,
-        "{\"type\":\"telemetry\",\"experiment\":\"exp2-01_hex_counter_32\","
+        "{\"type\":\"telemetry\",\"experiment\":\"%s\","
         "\"source\":\"fmc16\",\"sequence\":%lu,\"timestamp_ms\":%lu,"
         "\"mode\":%u,\"clk_sel\":%u,\"clock_hz\":%lu,"
         "\"pi_applied\":%u,\"pi_requested\":%u,"
         "\"pi_virtual_toggle\":%u,\"virtual_key_state\":%u,"
         "\"virtual_key_count\":%u,"
         "\"control_ack\":%lu,"
+        "\"panel_control_ack\":%lu,"
         "\"key_state\":%u,\"key_event_count\":%u,"
         "\"po\":%lu,\"pio\":%u}",
+        experiment,
         (unsigned long)snapshot->sequence,
         (unsigned long)snapshot->timestamp_ms,
         (unsigned int)snapshot->mode,
@@ -352,10 +428,156 @@ static int ETH_FormatM0Payload(const M0_DataSnapshot *snapshot,
         (unsigned int)snapshot->virtual_key_state,
         (unsigned int)snapshot->virtual_key_count,
         (unsigned long)snapshot->control_ack,
+        (unsigned long)panel_ack,
         (unsigned int)snapshot->key_state,
         (unsigned int)snapshot->key_event_count,
         (unsigned long)snapshot->po,
         (unsigned int)snapshot->pio);
+}
+
+static int ETH_SendEnvironmentPacket(int sock,
+                                     const struct sockaddr_in *server_addr,
+                                     const char *module,
+                                     uint32_t sequence,
+                                     uint32_t timestamp_ms,
+                                     const char *data_json,
+                                     char *payload,
+                                     size_t payload_size)
+{
+    int payload_len;
+    int sent;
+
+    payload_len = snprintf(
+        payload, payload_size,
+        "{\"ver\":\"1.0\",\"type\":\"module.data\",\"module\":\"%s\","
+        "\"seq\":%lu,\"ts_ms\":%lu,\"data\":%s}",
+        module, (unsigned long)sequence, (unsigned long)timestamp_ms,
+        data_json);
+    if ((payload_len <= 0) || ((size_t)payload_len >= payload_size))
+    {
+        return -1;
+    }
+    sent = lwip_sendto(sock, payload, (size_t)payload_len, 0,
+                       (const struct sockaddr *)server_addr,
+                       sizeof(*server_addr));
+    return (sent == payload_len) ? 0 : -1;
+}
+
+static int ETH_SendEnvironment(int sock,
+                               const struct sockaddr_in *server_addr,
+                               uint32_t *module_sequence,
+                               char *payload,
+                               size_t payload_size)
+{
+    BoardMonitorSnapshot monitor;
+    BoardPanelSnapshot panel;
+    char data_json[256];
+    int length;
+
+    if ((module_sequence == NULL) ||
+        (BoardMonitor_GetSnapshot(&monitor) == 0U))
+    {
+        return 1;
+    }
+
+    length = snprintf(data_json, sizeof(data_json),
+        "{\"temp_dezi\":%ld,\"rh_dezi\":%u,\"temp_ok\":%u,"
+        "\"hi_alarm\":%u,\"level\":%u,\"last_result\":%ld,"
+        "\"fail_streak\":%u,\"raw_temp\":%u,\"raw_rh\":%u,"
+        "\"probe_mask_40_47\":%u,\"probe_mask_known\":%u,"
+        "\"pca9617_enabled\":%u}",
+        (long)monitor.temperature_deci_c,
+        (unsigned int)monitor.humidity_deci_percent,
+        (unsigned int)monitor.sht40_valid,
+        (unsigned int)((monitor.sht40_valid != 0U) &&
+                       (monitor.temperature_level >= 2U)),
+        (unsigned int)monitor.temperature_level,
+        (long)board_monitor_dbg.sht40_last_result,
+        (unsigned int)board_monitor_dbg.sht40_fail_streak,
+        (unsigned int)board_monitor_dbg.sht40_raw_temperature,
+        (unsigned int)board_monitor_dbg.sht40_raw_humidity,
+        (unsigned int)board_monitor_dbg.probe_mask_40_47,
+        (unsigned int)board_monitor_dbg.probe_mask_known,
+        (unsigned int)board_monitor_dbg.pca9617_enabled);
+    if ((length <= 0) || ((size_t)length >= sizeof(data_json)) ||
+        (ETH_SendEnvironmentPacket(sock, server_addr, "sht40",
+             ++(*module_sequence), monitor.timestamp_ms, data_json,
+             payload, payload_size) != 0))
+    {
+        return -1;
+    }
+
+    length = snprintf(data_json, sizeof(data_json),
+        "{\"cur_ma\":%ld,\"over_cur\":%u,\"valid\":%u,\"level\":%u,"
+        "\"last_result\":%ld,\"fail_streak\":%u,\"raw_shunt\":%d,"
+        "\"configured\":%u}",
+        (long)monitor.u10_current_ma,
+        (unsigned int)((monitor.u10_valid != 0U) &&
+                       (monitor.u10_level >= 2U)),
+        (unsigned int)monitor.u10_valid,
+        (unsigned int)monitor.u10_level,
+        (long)board_monitor_dbg.u10_last_result,
+        (unsigned int)board_monitor_dbg.u10_fail_streak,
+        (int)board_monitor_dbg.u10_raw_shunt,
+        (unsigned int)board_monitor_dbg.u10_configured);
+    if ((length <= 0) || ((size_t)length >= sizeof(data_json)) ||
+        (ETH_SendEnvironmentPacket(sock, server_addr, "ina226_u10",
+             ++(*module_sequence), monitor.timestamp_ms, data_json,
+             payload, payload_size) != 0))
+    {
+        return -1;
+    }
+
+    length = snprintf(data_json, sizeof(data_json),
+        "{\"cur_ma\":%ld,\"over_cur\":%u,\"valid\":%u,\"level\":%u,"
+        "\"last_result\":%ld,\"fail_streak\":%u,\"raw_shunt\":%d,"
+        "\"configured\":%u}",
+        (long)monitor.u44_current_ma,
+        (unsigned int)((monitor.u44_valid != 0U) &&
+                       (monitor.u44_level >= 2U)),
+        (unsigned int)monitor.u44_valid,
+        (unsigned int)monitor.u44_level,
+        (long)board_monitor_dbg.u44_last_result,
+        (unsigned int)board_monitor_dbg.u44_fail_streak,
+        (int)board_monitor_dbg.u44_raw_shunt,
+        (unsigned int)board_monitor_dbg.u44_configured);
+    if ((length <= 0) || ((size_t)length >= sizeof(data_json)) ||
+        (ETH_SendEnvironmentPacket(sock, server_addr, "ina226_u44",
+             ++(*module_sequence), monitor.timestamp_ms, data_json,
+             payload, payload_size) != 0))
+    {
+        return -1;
+    }
+    if (BoardPanel_GetSnapshot(&panel) != 0U)
+    {
+        length = snprintf(data_json, sizeof(data_json),
+            "{\"sw\":%u,\"yds\":%u,\"eth_link\":%u,"
+            "\"usb_active\":%u,\"buzzer_mute\":%u,"
+            "\"alarm_level\":%u,\"valid\":%u,\"last_result\":%ld}",
+            (unsigned int)panel.switch_bitmap,
+            (unsigned int)panel.yds_bitmap,
+            (unsigned int)((netif_is_up(&gnetif) &&
+                            netif_is_link_up(&gnetif)) ? 1U : 0U),
+            (unsigned int)panel.usb_active,
+            (unsigned int)panel.buzzer_mute,
+            (unsigned int)panel.alarm_level,
+            (unsigned int)panel.valid,
+            (long)board_panel_dbg.last_result);
+        if ((length <= 0) || ((size_t)length >= sizeof(data_json)) ||
+            (ETH_SendEnvironmentPacket(sock, server_addr, "pcal6524",
+                 ++(*module_sequence), panel.timestamp_ms, data_json,
+                 payload, payload_size) != 0))
+        {
+            return -1;
+        }
+        eth_task_dbg.environment_send_count += 4U;
+    }
+    else
+    {
+        eth_task_dbg.environment_send_count += 3U;
+    }
+    eth_task_dbg.last_environment_sequence = monitor.sequence;
+    return 0;
 }
 
 void ETHDefaultTask(void const *argument)
@@ -363,12 +585,16 @@ void ETHDefaultTask(void const *argument)
     int sock = -1;
     int payload_len;
     int sent;
+    int environment_result;
     char payload[448];
     struct sockaddr_in server_addr;
     M0_DataSnapshot snapshot;
+    BoardPanelSnapshot panel_snapshot;
     uint8_t have_snapshot = 0U;
     uint32_t snapshot_count = 0U;
     uint32_t next_publish_ms;
+    uint32_t next_environment_ms;
+    uint32_t module_sequence = 0U;
     uint32_t now_ms;
     osThreadId network_init_handle;
 
@@ -413,6 +639,7 @@ void ETHDefaultTask(void const *argument)
 
     ETH_FillServerAddress(&server_addr);
     next_publish_ms = HAL_GetTick();
+    next_environment_ms = next_publish_ms + ETH_ENVIRONMENT_PERIOD_MS;
 
     for (;;)
     {
@@ -469,6 +696,15 @@ void ETHDefaultTask(void const *argument)
         have_snapshot = 1U;
         snapshot_count++;
         eth_task_dbg.last_fmc_result = M0_FMC_OK;
+        /* Physical F10 changes the XO2 mode without going through the web.
+         * Reconcile the external BSW route only when that mode actually
+         * changes.  Reapplying the route on every snapshot would overwrite
+         * explicit web/manual B-switch settings before they can be used. */
+        if ((BoardPanel_GetSnapshot(&panel_snapshot) != 0U) &&
+            (panel_snapshot.mode != snapshot.mode))
+        {
+            (void)BoardPanel_ApplyModeRoute(snapshot.mode);
+        }
 
         /* Acquisition is independent of Ethernet.  A missing cable or server
          * must not freeze the physical display or hide the experiment state
@@ -543,6 +779,26 @@ void ETHDefaultTask(void const *argument)
                                   LCD_STATUS_SEND_OK,
                                   eth_task_dbg.send_count,
                                   eth_task_dbg.send_error_count);
+            }
+
+            now_ms = HAL_GetTick();
+            if ((int32_t)(now_ms - next_environment_ms) >= 0)
+            {
+                environment_result = ETH_SendEnvironment(
+                    sock, &server_addr, &module_sequence,
+                    payload, sizeof(payload));
+                if (environment_result == 0)
+                {
+                    next_environment_ms = now_ms +
+                                          ETH_ENVIRONMENT_PERIOD_MS;
+                }
+                else if (environment_result < 0)
+                {
+                    eth_task_dbg.environment_send_error_count++;
+                    eth_task_dbg.last_errno = errno;
+                    lwip_close(sock);
+                    sock = -1;
+                }
             }
         }
 

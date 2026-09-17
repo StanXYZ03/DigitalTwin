@@ -39,6 +39,7 @@ module seg_show #(
     wire [7:0]  segment_port_raw;
     wire        mode5_raw_direct;
     wire        mode9_raw_direct;
+    wire        mode_msb_first;
 
     function [7:0] seg_decode;
         input [3:0] val;
@@ -112,6 +113,9 @@ module seg_show #(
 
     assign mode5_raw_direct = (mode == 4'd5);
     assign mode9_raw_direct = (mode == 4'd9);
+    // M0/M10/M11 carry a normal 32-bit hexadecimal value.  Keep the most
+    // significant nibble on the left, matching the web representation.
+    assign mode_msb_first   = (mode == 4'd0) || (mode == 4'd10) || (mode == 4'd11);
     assign digit_port_raw   = mode5_raw_direct ? spi_data_reg[31:24] :
                               mode9_raw_direct ? spi_data_reg[31:24] :
                                                  digit_sel_reg;
@@ -191,7 +195,6 @@ module seg_show #(
             4'd4:  blank_digit = 1'b0;
             4'd6:  blank_digit = (digit_index < 3'd4);
             4'd7:  blank_digit = 1'b0;
-            4'd11,
             4'd12: blank_digit = 1'b1;
             default: blank_digit = 1'b0;
         endcase
@@ -222,7 +225,7 @@ module seg_show #(
                     endcase
                 end
                 default: begin
-                    if (mode == 4'd0)
+                    if (mode_msb_first)
                         seg_pattern_raw = seg_decode(mode0_nibble(spi_data_reg, digit_index));
                     else
                         seg_pattern_raw = seg_decode(digit_nibble(spi_data_reg, digit_index));

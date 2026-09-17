@@ -59,6 +59,11 @@ static int test_command_builder(void)
     CHECK(packet[14] == FMC16_SCHEMA_V1_0);
     CHECK(packet[15] == 0U && packet[16] == 0U);
 
+    fmc16_build_command(packet, 2U, 3U, FMC16_OPCODE_SET_MODE, 11U);
+    CHECK(fmc16_validate_packet(packet, FMC16_COMMAND_WORDS) == M0_FMC_OK);
+    CHECK(packet[13] == FMC16_OPCODE_SET_MODE);
+    CHECK(packet[15] == 11U);
+
     packet[15] ^= 1U;
     CHECK(fmc16_validate_packet(packet, FMC16_COMMAND_WORDS) ==
           M0_FMC_ERR_PACKET_CRC);
@@ -74,7 +79,7 @@ static int test_status_response(void)
     uint16_t packet[FMC16_MAX_PACKET_WORDS];
     const uint16_t payload[14] = {
         FMC16_OPCODE_GET_STATUS, FMC16_STATUS_OK, 0x0000U, 10U,
-        FMC16_SCHEMA_V1_0, 0x0306U, 0x1F00U, 0x0005U, 0x002AU,
+        FMC16_SCHEMA_V1_0, 0x0306U, 0x1F00U, 0x0005U, 0xB02AU,
         0x1122U, 0x3344U, 0x55AAU, 0x0009U, 0xC4D2U
     };
     M0_DataSnapshot snapshot;
@@ -93,6 +98,7 @@ static int test_status_response(void)
     CHECK(snapshot.pi_requested == 0x1F00U);
     CHECK(snapshot.key_state == 0x0005U);
     CHECK(snapshot.key_event_count == 0x002AU);
+    CHECK(snapshot.mode == 11U);
     CHECK(snapshot.pi_applied == 0U);
     CHECK(snapshot.timestamp_ms == 0x0009C4D2UL);
 
@@ -119,6 +125,28 @@ static int test_status_response(void)
     }
     CHECK(fmc16_parse_status_response(packet, words, 0x55667788UL,
                                       &snapshot) == M0_FMC_ERR_VALIDITY);
+    return 0;
+}
+
+static int test_mode_response(void)
+{
+    uint16_t packet[FMC16_MAX_PACKET_WORDS];
+    const uint16_t payload[10] = {
+        FMC16_OPCODE_SET_MODE, FMC16_STATUS_OK, 0U, 1U,
+        11U, 0U, 0U, 0U, 0U, 0U
+    };
+    size_t words;
+
+    words = make_xo2_packet(packet, FMC16_TYPE_RESPONSE,
+                            FMC16_CHANNEL_COMMAND, payload, 10U,
+                            4U, 0x55667788UL);
+    CHECK(words == FMC16_MODE_RESPONSE_WORDS);
+    CHECK(fmc16_parse_mode_response(packet, words, 0x55667788UL, 11U) ==
+          M0_FMC_OK);
+    CHECK(fmc16_parse_mode_response(packet, words, 0x55667788UL, 10U) ==
+          M0_FMC_ERR_RESPONSE);
+    CHECK(fmc16_parse_mode_response(packet, words, 0x55667789UL, 11U) ==
+          M0_FMC_ERR_RESPONSE);
     return 0;
 }
 
@@ -160,6 +188,12 @@ int main(void)
     {
         fprintf(stderr, "startup packet test failed at line %d\n", line);
         return 3;
+    }
+    line = test_mode_response();
+    if (line != 0)
+    {
+        fprintf(stderr, "mode response test failed at line %d\n", line);
+        return 4;
     }
     puts("M0 FMC16 protocol tests: ALL PASS");
     return 0;

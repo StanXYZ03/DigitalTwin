@@ -1255,6 +1255,16 @@
               <FileType>1</FileType>
               <FilePath>..\Core\Src\fpga_autoconfig.c</FilePath>
             </File>
+            <File>
+              <FileName>board_monitor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\board_monitor.c</FilePath>
+            </File>
+            <File>
+              <FileName>board_panel.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\board_panel.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -1269,6 +1279,11 @@
               <FileName>bsp_lcd_rgb.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Bsp\bsp_lcd_rgb.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_i2c_ui.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Bsp\bsp_i2c_ui.c</FilePath>
             </File>
           </Files>
         </Group>

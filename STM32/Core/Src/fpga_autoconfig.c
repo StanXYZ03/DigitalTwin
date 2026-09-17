@@ -1,5 +1,6 @@
 #include "fpga_autoconfig.h"
 
+#include "bsp_i2c_ui.h"
 #include "cmsis_os.h"
 
 /* Bridge wiring, checked against the schematic and the working DSO project:
@@ -31,10 +32,6 @@
 #define MCP23017_REG_IOCON      0x0AU
 #define MCP23017_REG_GPIOA      0x12U
 
-#define I2C_PORT                GPIOB
-#define I2C_SDA_PIN             GPIO_PIN_7
-#define I2C_SCL_PIN             GPIO_PIN_8
-
 #define FPGA_MUX_OE_PORT        GPIOH
 #define FPGA_MUX_OE_PIN         GPIO_PIN_7
 #define FPGA_PROGRAM_PORT       GPIOE
@@ -52,167 +49,25 @@ volatile FPGA_AutoConfigDebug fpga_autoconfig_dbg;
 
 static void FPGA_ModeControlPins_Init(void);
 
-static void FPGA_DelayUs(uint32_t microseconds)
-{
-  uint32_t start;
-  uint32_t ticks;
-
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-  start = DWT->CYCCNT;
-  ticks = (SystemCoreClock / 1000000U) * microseconds;
-  while ((uint32_t)(DWT->CYCCNT - start) < ticks)
-  {
-  }
-}
-
-static void I2C_Delay(void)
-{
-  FPGA_DelayUs(100U);
-}
-
-static void I2C_Stop(void);
-
 static void I2C_BusRecover(void)
 {
-  uint32_t i;
-
-  /* Release SDA and clock out a slave which may have been left part-way
-   * through a byte by the preceding MCU/board reset. */
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_SET);
-  for (i = 0U; i < 9U; ++i)
-  {
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-    I2C_Delay();
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-    I2C_Delay();
-  }
-  I2C_Stop();
-}
-
-static void I2C_Start(void)
-{
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN | I2C_SCL_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_RESET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-}
-
-static void I2C_Stop(void)
-{
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_RESET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-}
-
-static uint8_t I2C_SendByte(uint8_t value)
-{
-  uint32_t i;
-  uint8_t nack;
-
-  for (i = 0U; i < 8U; ++i)
-  {
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN,
-                      ((value & 0x80U) != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    I2C_Delay();
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-    I2C_Delay();
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-    value <<= 1U;
-  }
-
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-  nack = (HAL_GPIO_ReadPin(I2C_PORT, I2C_SDA_PIN) == GPIO_PIN_SET) ? 1U : 0U;
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-  return nack;
-}
-
-static uint8_t I2C_ReadByteNack(void)
-{
-  uint32_t i;
-  uint8_t value = 0U;
-
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_SET);
-  for (i = 0U; i < 8U; ++i)
-  {
-    value <<= 1U;
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-    I2C_Delay();
-    if (HAL_GPIO_ReadPin(I2C_PORT, I2C_SDA_PIN) == GPIO_PIN_SET)
-    {
-      value |= 1U;
-    }
-    HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-    I2C_Delay();
-  }
-
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN, GPIO_PIN_SET); /* NACK */
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_SET);
-  I2C_Delay();
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SCL_PIN, GPIO_PIN_RESET);
-  return value;
+  BSP_I2C_UI_BusRecover();
 }
 
 static int32_t PCAL_WriteReg(uint8_t reg, uint8_t value)
 {
-  int32_t result = 0;
-
-  I2C_Start();
-  result |= (int32_t)I2C_SendByte((uint8_t)(PCAL6524_ADDR7 << 1U));
-  result |= (int32_t)I2C_SendByte(reg);
-  result |= (int32_t)I2C_SendByte(value);
-  I2C_Stop();
-  return (result == 0) ? 0 : -1;
+  return BSP_I2C_UI_WriteReg(PCAL6524_ADDR7, reg, value);
 }
 
 static int32_t PCAL_ReadReg(uint8_t reg, uint8_t *value)
 {
-  int32_t result = 0;
-
-  I2C_Start();
-  result |= (int32_t)I2C_SendByte((uint8_t)(PCAL6524_ADDR7 << 1U));
-  result |= (int32_t)I2C_SendByte(reg);
-  I2C_Start();
-  result |= (int32_t)I2C_SendByte((uint8_t)((PCAL6524_ADDR7 << 1U) | 1U));
-  if (result == 0)
-  {
-    *value = I2C_ReadByteNack();
-  }
-  I2C_Stop();
-  return (result == 0) ? 0 : -1;
+  return BSP_I2C_UI_ReadReg(PCAL6524_ADDR7, reg, value);
 }
 
 static int32_t I2C_WriteBytes(uint8_t address7, uint8_t reg,
                               const uint8_t *data, uint32_t length)
 {
-  uint32_t index;
-  int32_t result = 0;
-
-  if ((data == NULL) || (length == 0U))
-  {
-    return -1;
-  }
-  I2C_Start();
-  result |= (int32_t)I2C_SendByte((uint8_t)(address7 << 1U));
-  result |= (int32_t)I2C_SendByte(reg);
-  for (index = 0U; index < length; ++index)
-  {
-    result |= (int32_t)I2C_SendByte(data[index]);
-  }
-  I2C_Stop();
-  if (result != 0)
-  {
-    I2C_BusRecover();
-    return -1;
-  }
-  return 0;
+  return BSP_I2C_UI_WriteBytes(address7, reg, data, length);
 }
 
 HAL_StatusTypeDef FPGA_PI_Init(void)
@@ -273,15 +128,8 @@ static void FPGA_ModeControlPins_Init(void)
 {
   GPIO_InitTypeDef gpio = {0};
 
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
-
-  HAL_GPIO_WritePin(I2C_PORT, I2C_SDA_PIN | I2C_SCL_PIN, GPIO_PIN_SET);
-  gpio.Pin = I2C_SDA_PIN | I2C_SCL_PIN;
-  gpio.Mode = GPIO_MODE_OUTPUT_OD;
-  gpio.Pull = GPIO_NOPULL;
-  gpio.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(I2C_PORT, &gpio);
+  BSP_I2C_UI_Init();
 
   HAL_GPIO_WritePin(FPGA_MUX_OE_PORT, FPGA_MUX_OE_PIN, GPIO_PIN_SET);
   gpio.Pin = FPGA_MUX_OE_PIN;

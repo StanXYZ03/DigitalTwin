@@ -81,9 +81,11 @@ void Error_Handler(void);
  * build now always uses the deterministic PI-before-configuration sequence. */
 #define FPGA_CONFIG_RELEASE_DIAG  0U
 
-/* 1 = fully passive configuration diagnostic.  Normal operation must remain
- * 0 because this board requires STM32 to establish M[2:0] and request the
- * cold-start configuration sequence before the JTAG-only pins are released. */
+/* The bridge already straps Artix-7 M[2:0]=001 with 1 kOhm resistors.  Keep
+ * PROGRAM_B released and let the FPGA cold-boot directly from SPI Flash;
+ * pulsing PROGRAM_B again after startup is unnecessary and can destroy an
+ * otherwise successful boot.  PI key injection is initialized independently
+ * by M0_DataSource_Init(). */
 #define FPGA_EXTERNAL_JTAG_PASSIVE  0U
 
 /* 1 = keep the Lattice/FMC data bridge disconnected after FPGA startup and

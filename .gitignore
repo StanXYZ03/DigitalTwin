@@ -29,6 +29,8 @@ STM32/MDK-ARM/FMC16_LINK_TEST_CLEAN/
 STM32/MDK-ARM/STM32H743_XC7A100_PS_Configuration/
 STM32/MDK-ARM/*.uvguix.*
 STM32/MDK-ARM/*.uvoptx
+STM32/MDK-ARM/*.txt
+STM32/MDK-ARM/*.ini
 *.o
 *.d
 *.crf
@@ -45,7 +47,23 @@ STM32/MDK-ARM/*.uvoptx
 Lattice/lattice_fmc16_m0_platform/impl_fmc16_link_test/
 Lattice/lattice_fmc16_m0_platform/temp/
 Lattice/lattice_fmc16_m0_platform/work/
+Lattice/lattice_fmc16_m0_platform/sim/work/
 Lattice/lattice_fmc16_m0_platform/*.jed
 Lattice/lattice_fmc16_m0_platform/*.jed.*
 Lattice/lattice_fmc16_m0_platform/*.pre_*.v
 Lattice/lattice_fmc16_m0_platform/*.prefetch_*.v
+
+# Imported reference project used for comparison only (not product source)
+module_telemetry_delivery/
+
+# Vivado generated outputs; keep RTL, constraints and Tcl scripts only
+Xilinx/**/output/
+Xilinx/**/*.bit
+Xilinx/**/*.bin
+Xilinx/**/*.mcs
+Xilinx/**/*.dcp
+Xilinx/**/*.prm
+Xilinx/**/*.rpt
+Xilinx/**/vivado.jou
+Xilinx/**/vivado.log
+Xilinx/**/usage_statistics_webtalk.*
