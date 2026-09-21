@@ -27,6 +27,19 @@ typedef struct
     uint8_t clk_sel;
 } M0_DataSnapshot;
 
+/* One complete physical 16-column scan captured without interpreting the
+ * experiment pattern. columns[c] bit r is the actual I_ROW[r] level sampled
+ * while the actual I_COL value was c. */
+typedef struct
+{
+    uint32_t frame_sequence;
+    uint32_t capture_timestamp_ms;
+    uint16_t valid_columns;
+    uint16_t columns[16];
+    uint8_t mode;
+    uint8_t valid;
+} M0_MatrixSnapshot;
+
 typedef enum
 {
     M0_FMC_OK = 0,
@@ -91,6 +104,13 @@ typedef struct
     uint32_t bridge_settle_cycles;
     uint32_t matrix_diag_samples;
     uint32_t matrix_diag_changes;
+    uint32_t matrix_read_attempts;
+    uint32_t matrix_read_successes;
+    uint32_t matrix_read_failures;
+    uint32_t matrix_frame_sequence;
+    uint32_t matrix_capture_timestamp_ms;
+    uint16_t matrix_valid_columns;
+    uint16_t matrix_columns[16];
     uint16_t matrix_rows;
     uint8_t matrix_col;
     uint8_t matrix_scan_heartbeat;
@@ -103,6 +123,7 @@ extern volatile M0_FmcDebug m0_fmc_dbg;
 
 void M0_DataSource_Init(void);
 uint8_t M0_DataSource_Read(M0_DataSnapshot *snapshot);
+uint8_t M0_DataSource_ReadMatrix(M0_MatrixSnapshot *snapshot);
 int32_t M0_DataSource_VirtualKeySet(uint8_t f_number,
                                    uint8_t pressed,
                                    uint32_t command_id);

@@ -53,7 +53,7 @@
 /* Temporary hardware-isolation switch: force the already proven M11 BSW
  * route after PCAL6524 initialization, without waiting for FMC/F10 mode
  * reconciliation.  Keep this enabled only while diagnosing the matrix. */
-#define PANEL_FORCE_DOT_MATRIX_DIAG  1U
+#define PANEL_FORCE_DOT_MATRIX_DIAG  0U
 
 volatile BoardPanelDebug board_panel_dbg;
 static BoardPanelSnapshot board_panel_snapshot;
@@ -505,6 +505,11 @@ int32_t BoardPanel_ApplyModeRoute(uint8_t mode)
     uint16_t current;
     int32_t result;
 
+#if PANEL_FORCE_DOT_MATRIX_DIAG
+    /* Hardware diagnosis owns the mux route.  Ignore stale M0 mode telemetry
+     * so the runtime reconciliation task cannot disconnect the matrix. */
+    mode = PANEL_MODE_DOT_MATRIX;
+#endif
     if ((mode != PANEL_MODE_COUNTER) &&
         (mode != PANEL_MODE_DOT_MATRIX))
         return -1;

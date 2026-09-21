@@ -286,27 +286,30 @@ HAL_StatusTypeDef FPGA_ConfigModeHold_Run(void)
 HAL_StatusTypeDef FPGA_AutoConfig_Run(void)
 {
   uint32_t attempt;
+  HAL_StatusTypeDef pi_result;
 
   fpga_autoconfig_dbg.run_count++;
 
-  /* Keep the currently running user design alive unless every prerequisite
-     for a clean restart is ready.  This is the fail-safe boundary: no I2C
-     failure may leave PROGRAM_B asserted. */
+  /* PI expansion is useful to establish a known key state, but it is not a
+     configuration prerequisite.  In particular, a transient MCP23017 I2C
+     failure must not prevent the independent PCAL6524 mode path from putting
+     the FPGA into Master-SPI mode and restarting it from verified flash.
+     M0_DataSource_Init() retries PI initialization during normal runtime. */
   FPGA_AutoConfig_SamplePins();
-  if (FPGA_PI_Init() != HAL_OK)
-  {
-    HAL_GPIO_WritePin(FPGA_PROGRAM_PORT, FPGA_PROGRAM_PIN, GPIO_PIN_SET);
-    fpga_autoconfig_dbg.state = FPGA_AUTOCONFIG_I2C_ERROR;
-    FPGA_AutoConfig_SamplePins();
-    return HAL_ERROR;
-  }
+  pi_result = FPGA_PI_Init();
 
+  /* The PCAL6524 mode path is the actual fail-safe boundary.  Never pulse
+     PROGRAM_B unless M[2:0]=001 has been established and the mux enabled. */
   if (FPGA_SetModeAndEnable() != HAL_OK)
   {
     HAL_GPIO_WritePin(FPGA_PROGRAM_PORT, FPGA_PROGRAM_PIN, GPIO_PIN_SET);
     FPGA_AutoConfig_SamplePins();
     return HAL_ERROR;
   }
+
+  /* Preserve the PI failure in its dedicated debug fields; configuration
+     proceeds and the runtime retry path will recover the key expander. */
+  (void)pi_result;
 
   /* Allow U7 and the mode nets to settle before PROGRAM_B is asserted. */
   osDelay(100U);

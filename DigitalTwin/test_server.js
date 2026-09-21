@@ -2,7 +2,7 @@
 const assert = require('assert');
 const { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
   buildPanelControlFrame, crc16Ccitt,
-  displayModel, isNewer32, validateModuleData } = require('./server');
+  displayModel, isNewer32, validateMatrixRaw, validateModuleData } = require('./server');
 
 function packet(sequence=1, timestamp_ms=100, po=0, pio=0) {
   return { type:'telemetry', experiment:'exp2-01_hex_counter_32', source:'fmc16',
@@ -46,6 +46,21 @@ assert.strictEqual(s.acceptModule(panelPacket,'192.168.100.50',4500).accepted,tr
 assert.strictEqual(s.snapshot(4500).modules.pcal6524.data.sw,0x1001);
 assert.throws(()=>validateModuleData({...panelPacket,data:{...panelPacket.data,sw:0x200}},
   '192.168.100.50'),/data/);
+
+const matrixPacket={type:'matrix.raw',experiment:'exp3-04_dot_matrix_led',
+  source:'fmc16',mode:11,frame_sequence:7,capture_timestamp_ms:4210,
+  valid_columns:0xffff,columns:Array.from({length:16},(_,i)=>(1<<i)&0xffff)};
+assert.strictEqual(validateMatrixRaw(matrixPacket,'192.168.100.50'),matrixPacket);
+assert.strictEqual(s.acceptMatrix(matrixPacket,'192.168.100.50',4510).accepted,true);
+assert.strictEqual(s.snapshot(4510).matrix.columns[8],0x0100);
+assert.strictEqual(s.snapshot(4510).matrix.fresh,true);
+assert.strictEqual(s.acceptMatrix(matrixPacket,'192.168.100.50',4520).reason,'duplicate');
+assert.strictEqual(s.acceptMatrix({...matrixPacket,frame_sequence:6},
+  '192.168.100.50',4530).reason,'outOfOrder');
+assert.strictEqual(s.acceptMatrix({...matrixPacket,frame_sequence:8,valid_columns:0x7fff},
+  '192.168.100.50',4540).reason,'frame');
+assert.strictEqual(s.acceptMatrix({...matrixPacket,frame_sequence:8,columns:[1,2]},
+  '192.168.100.50',4540).reason,'columns');
 
 const frame=buildControlFrame(2,'down',0x12345678);
 assert.strictEqual(frame.length,16);

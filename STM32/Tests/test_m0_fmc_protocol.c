@@ -150,6 +150,64 @@ static int test_mode_response(void)
     return 0;
 }
 
+static int test_matrix_response(void)
+{
+    uint16_t packet[FMC16_MAX_PACKET_WORDS];
+    uint16_t payload[17];
+    M0_MatrixSnapshot snapshot;
+    size_t words;
+    size_t i;
+
+    memset(payload, 0, sizeof(payload));
+    memset(&snapshot, 0, sizeof(snapshot));
+    payload[0] = FMC16_OPCODE_GET_MATRIX;
+    payload[1] = FMC16_STATUS_OK;
+    payload[3] = 13U;
+    payload[4] = 0xC00BU;
+    payload[5] = 0xFFFFU;
+    payload[6] = 0x1122U;
+    payload[7] = 0x3344U;
+    for (i = 0U; i < 8U; ++i)
+    {
+        payload[8U + i] = (uint16_t)(0x0101U * (uint16_t)i);
+    }
+    payload[16] = 0x7788U;
+
+    words = make_xo2_packet(packet, FMC16_TYPE_RESPONSE,
+                            FMC16_CHANNEL_COMMAND, payload, 17U,
+                            9U, 0xA1B2C3D4UL);
+    CHECK(words == FMC16_MATRIX_RESPONSE_WORDS);
+    CHECK(fmc16_parse_matrix_response(packet, words, 0xA1B2C3D4UL,
+                                      0U, &snapshot) == M0_FMC_OK);
+
+    payload[4] = 0xC10BU;
+    for (i = 0U; i < 8U; ++i)
+    {
+        payload[8U + i] = (uint16_t)(0x0101U * (uint16_t)(i + 8U));
+    }
+    words = make_xo2_packet(packet, FMC16_TYPE_RESPONSE,
+                            FMC16_CHANNEL_COMMAND, payload, 17U,
+                            10U, 0xA1B2C3D5UL);
+    CHECK(fmc16_parse_matrix_response(packet, words, 0xA1B2C3D5UL,
+                                      1U, &snapshot) == M0_FMC_OK);
+    CHECK(snapshot.valid == 1U && snapshot.mode == 11U);
+    CHECK(snapshot.valid_columns == 0xFFFFU);
+    CHECK(snapshot.frame_sequence == 0x11223344UL);
+    CHECK(snapshot.capture_timestamp_ms == 0x7788UL);
+    for (i = 0U; i < 16U; ++i)
+    {
+        CHECK(snapshot.columns[i] == (uint16_t)(0x0101U * (uint16_t)i));
+    }
+
+    payload[5] = 0x7FFFU;
+    words = make_xo2_packet(packet, FMC16_TYPE_RESPONSE,
+                            FMC16_CHANNEL_COMMAND, payload, 17U,
+                            10U, 0xA1B2C3D4UL);
+    CHECK(fmc16_parse_matrix_response(packet, words, 0xA1B2C3D4UL,
+                                      1U, &snapshot) == M0_FMC_ERR_VALIDITY);
+    return 0;
+}
+
 static int test_startup_packet_is_not_response(void)
 {
     uint16_t packet[FMC16_MAX_PACKET_WORDS];
@@ -194,6 +252,12 @@ int main(void)
     {
         fprintf(stderr, "mode response test failed at line %d\n", line);
         return 4;
+    }
+    line = test_matrix_response();
+    if (line != 0)
+    {
+        fprintf(stderr, "matrix response test failed at line %d\n", line);
+        return 5;
     }
     puts("M0 FMC16 protocol tests: ALL PASS");
     return 0;

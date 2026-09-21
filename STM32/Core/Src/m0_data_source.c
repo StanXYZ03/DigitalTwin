@@ -16,11 +16,13 @@
 #define FMC16_CHANNEL_COMMAND          0x0002U
 #define FMC16_OPCODE_GET_STATUS        0x0003U
 #define FMC16_OPCODE_SET_MODE          0x0004U
+#define FMC16_OPCODE_GET_MATRIX        0x0005U
 #define FMC16_SCHEMA_V1_0              0x0100U
 #define FMC16_STATUS_OK                0x0000U
 #define FMC16_COMMAND_WORDS            19U
 #define FMC16_RESPONSE_WORDS           29U
 #define FMC16_MODE_RESPONSE_WORDS      25U
+#define FMC16_MATRIX_RESPONSE_WORDS    32U
 #define FMC16_MIN_PACKET_WORDS         15U
 #define FMC16_MAX_PACKET_WORDS         64U
 #define FMC16_MAX_EMPTY_READS          4096U
@@ -69,20 +71,15 @@ static uint8_t m0_sequence_is_newer(uint32_t candidate, uint32_t current)
     return ((delta != 0U) && (delta < 0x80000000UL)) ? 1U : 0U;
 }
 
-/* M0 preserves the established exp2-01 event wiring.  M11 exposes F1..F9
- * as PI0..PI8 for the dot-matrix control engine. F10 is platform-only. */
+/* Preserve the first, hardware-verified mapping in every mode:
+ * F1..F9 -> PI7..PI15 and F10 -> PI6. */
 static uint16_t m0_virtual_key_pi_bit(uint8_t f_number)
 {
     uint32_t pi_index;
 
     if (f_number == 10U)
     {
-        return 0U;
-    }
-    if ((active_data_mode == 11U) &&
-        (f_number >= 1U) && (f_number <= 9U))
-    {
-        return (uint16_t)(1UL << (uint32_t)(f_number - 1U));
+        return (uint16_t)(1UL << 6U);
     }
     if ((f_number >= 1U) && (f_number <= 9U))
     {
@@ -230,6 +227,17 @@ static void fmc16_build_status_command(uint16_t *packet,
     fmc16_build_command(packet, sequence, transaction,
                         FMC16_OPCODE_GET_STATUS, 0U);
 }
+
+#ifndef M0_FMC_PROTOCOL_TEST
+static void fmc16_build_matrix_command(uint16_t *packet,
+                                       uint32_t sequence,
+                                       uint32_t transaction,
+                                       uint8_t half)
+{
+    fmc16_build_command(packet, sequence, transaction,
+                        FMC16_OPCODE_GET_MATRIX, (uint16_t)half);
+}
+#endif
 
 static M0_FmcResult fmc16_validate_packet(const uint16_t *packet, size_t words)
 {
@@ -422,6 +430,62 @@ static M0_FmcResult fmc16_parse_mode_response(const uint16_t *packet,
     return M0_FMC_OK;
 }
 
+static M0_FmcResult fmc16_parse_matrix_response(const uint16_t *packet,
+                                                size_t words,
+                                                uint32_t transaction,
+                                                uint8_t requested_half,
+                                                M0_MatrixSnapshot *snapshot)
+{
+    uint32_t packet_transaction;
+    M0_FmcResult result;
+    size_t i;
+
+    if ((packet == NULL) || (snapshot == NULL))
+    {
+        return M0_FMC_ERR_ARGUMENT;
+    }
+    result = fmc16_validate_packet(packet, words);
+    if (result != M0_FMC_OK)
+    {
+        return result;
+    }
+    if ((words != FMC16_MATRIX_RESPONSE_WORDS) ||
+        ((uint8_t)(packet[4] >> 8) != FMC16_TYPE_RESPONSE) ||
+        (packet[5] != 0x0100U) ||
+        (packet[6] != FMC16_CHANNEL_COMMAND) ||
+        (packet[7] != 17U))
+    {
+        return M0_FMC_ERR_RESPONSE;
+    }
+
+    packet_transaction = ((uint32_t)packet[10] << 16) | packet[11];
+    if ((packet_transaction != transaction) ||
+        (packet[13] != FMC16_OPCODE_GET_MATRIX) ||
+        (packet[14] != FMC16_STATUS_OK) ||
+        (packet[16] != 13U) ||
+        (((packet[17] >> 8) & 1U) != requested_half))
+    {
+        return M0_FMC_ERR_RESPONSE;
+    }
+
+    snapshot->valid = (uint8_t)(((packet[17] & 0xC000U) == 0xC000U) &&
+                                (packet[18] == 0xFFFFU));
+    snapshot->mode = (uint8_t)(packet[17] & 0x000FU);
+    snapshot->valid_columns = packet[18];
+    snapshot->frame_sequence = ((uint32_t)packet[19] << 16) | packet[20];
+    snapshot->capture_timestamp_ms = packet[29];
+    for (i = 0U; i < 8U; ++i)
+    {
+        snapshot->columns[((size_t)requested_half * 8U) + i] =
+            packet[21U + i];
+    }
+    if ((snapshot->valid == 0U) || (snapshot->mode != 11U))
+    {
+        return M0_FMC_ERR_VALIDITY;
+    }
+    return M0_FMC_OK;
+}
+
 #ifndef M0_FMC_PROTOCOL_TEST
 void M0_DataSource_Init(void)
 {
@@ -542,20 +606,8 @@ uint8_t M0_DataSource_Read(M0_DataSnapshot *snapshot)
                 virtual_key_state = 0U;
             }
             physical_pi_requested = snapshot->pi_requested;
-            if (active_data_mode == 11U)
-            {
-                /* M11 uses held levels so the unmodified point-matrix
-                 * experiment sees one rising edge on press and a falling
-                 * edge on release. Physical and web holds retain XOR
-                 * arbitration. */
-                target_pi = (uint16_t)(physical_pi_requested ^
-                                       (virtual_key_state & 0x01FFU));
-            }
-            else
-            {
-                target_pi = (uint16_t)(physical_pi_requested ^
-                                       virtual_pi_toggle);
-            }
+            target_pi = (uint16_t)(physical_pi_requested ^
+                                   virtual_pi_toggle);
 
             if ((pi_driver_ready == 0U) ||
                 (target_pi != last_pi_applied))
@@ -626,6 +678,127 @@ uint8_t M0_DataSource_Read(M0_DataSnapshot *snapshot)
     m0_fmc_dbg.read_failures++;
     m0_fmc_dbg.last_result = result;
     fmc16_bridge_disable();
+    return 0U;
+}
+
+uint8_t M0_DataSource_ReadMatrix(M0_MatrixSnapshot *snapshot)
+{
+    uint16_t tx_packet[FMC16_COMMAND_WORDS];
+    uint16_t rx_packet[FMC16_MAX_PACKET_WORDS];
+    size_t rx_words;
+    uint32_t transaction;
+    uint32_t packet_index;
+    uint32_t i;
+    uint32_t first_frame_sequence;
+    uint8_t half;
+    uint8_t half_received;
+    M0_FmcResult result;
+
+    if (snapshot == NULL)
+    {
+        m0_fmc_dbg.last_result = M0_FMC_ERR_ARGUMENT;
+        return 0U;
+    }
+    if (m0_fmc_dbg.initialized == 0U)
+    {
+        M0_DataSource_Init();
+    }
+
+    m0_fmc_dbg.matrix_read_attempts++;
+    snapshot->valid = 0U;
+    first_frame_sequence = 0U;
+    result = M0_FMC_ERR_TIMEOUT;
+    for (half = 0U; half < 2U; ++half)
+    {
+        transaction = next_transaction_id++;
+        m0_fmc_dbg.command_sequence = next_command_sequence;
+        m0_fmc_dbg.transaction_id = transaction;
+        fmc16_build_matrix_command(tx_packet, next_command_sequence++,
+                                   transaction, half);
+
+        fmc16_bridge_enable();
+        for (i = 0U; i < FMC16_COMMAND_WORDS; ++i)
+        {
+            fmc16_write_word(tx_packet[i]);
+        }
+        __DSB();
+
+        half_received = 0U;
+        for (packet_index = 0U;
+             packet_index < FMC16_MAX_PACKETS_PER_QUERY;
+             ++packet_index)
+        {
+            rx_words = 0U;
+            result = fmc16_capture_packet(rx_packet, &rx_words);
+            m0_fmc_dbg.last_result = result;
+            m0_fmc_dbg.last_packet_words = (uint16_t)rx_words;
+            if (result != M0_FMC_OK)
+            {
+                if (result == M0_FMC_ERR_TIMEOUT)
+                {
+                    break;
+                }
+                if (result == M0_FMC_ERR_HEADER_CRC)
+                {
+                    m0_fmc_dbg.header_crc_error_count++;
+                }
+                else if (result == M0_FMC_ERR_PACKET_CRC)
+                {
+                    m0_fmc_dbg.packet_crc_error_count++;
+                }
+                else if (result == M0_FMC_ERR_LENGTH)
+                {
+                    m0_fmc_dbg.length_error_count++;
+                }
+                m0_fmc_dbg.ignored_packets++;
+                continue;
+            }
+
+            m0_fmc_dbg.last_packet_type = (uint16_t)(rx_packet[4] >> 8);
+            m0_fmc_dbg.last_packet_transaction =
+                ((uint32_t)rx_packet[10] << 16) | rx_packet[11];
+            result = fmc16_parse_matrix_response(rx_packet, rx_words,
+                                                 transaction, half, snapshot);
+            if (result == M0_FMC_OK)
+            {
+                half_received = 1U;
+                break;
+            }
+            m0_fmc_dbg.last_result = result;
+            m0_fmc_dbg.ignored_packets++;
+        }
+        fmc16_bridge_disable();
+
+        if (half_received == 0U)
+        {
+            goto matrix_failed;
+        }
+        if (half == 0U)
+        {
+            first_frame_sequence = snapshot->frame_sequence;
+        }
+        else if (snapshot->frame_sequence != first_frame_sequence)
+        {
+            result = M0_FMC_ERR_RESPONSE;
+            goto matrix_failed;
+        }
+    }
+
+    m0_fmc_dbg.matrix_frame_sequence = snapshot->frame_sequence;
+    m0_fmc_dbg.matrix_capture_timestamp_ms = snapshot->capture_timestamp_ms;
+    m0_fmc_dbg.matrix_valid_columns = snapshot->valid_columns;
+    for (i = 0U; i < 16U; ++i)
+    {
+        m0_fmc_dbg.matrix_columns[i] = snapshot->columns[i];
+    }
+    m0_fmc_dbg.matrix_read_successes++;
+    m0_fmc_dbg.last_result = M0_FMC_OK;
+    return 1U;
+
+matrix_failed:
+    snapshot->valid = 0U;
+    m0_fmc_dbg.matrix_read_failures++;
+    m0_fmc_dbg.last_result = result;
     return 0U;
 }
 
@@ -756,39 +929,6 @@ int32_t M0_DataSource_VirtualKeySet(uint8_t f_number,
     else
     {
         next_key_state &= (uint16_t)~state_bit;
-    }
-
-    /* M11 is level based: press drives the selected PI high and release
-     * drives it low.  This preserves long-press behavior and works with the
-     * original point-matrix RTL's rising-edge detector. */
-    if ((active_data_mode == 11U) && (f_number <= 9U))
-    {
-        target_pi = (uint16_t)(physical_pi_requested ^
-                               (next_key_state & 0x01FFU));
-        if ((pi_driver_ready == 0U) && (FPGA_PI_Init() == HAL_OK))
-        {
-            pi_driver_ready = 1U;
-        }
-        if ((pi_driver_ready == 0U) ||
-            (FPGA_PI_Write(target_pi) != HAL_OK))
-        {
-            pi_driver_ready = 0U;
-            m0_fmc_dbg.pi_i2c_error_count++;
-            m0_fmc_dbg.control_reject_count++;
-            return -3;
-        }
-        last_pi_applied = target_pi;
-        if ((pressed != 0U) && (was_pressed == 0U))
-        {
-            virtual_key_count++;
-        }
-        virtual_key_state = next_key_state;
-        last_control_id = command_id;
-        m0_fmc_dbg.pi_virtual_toggle = virtual_pi_toggle;
-        m0_fmc_dbg.virtual_key_state = virtual_key_state;
-        m0_fmc_dbg.virtual_key_count = virtual_key_count;
-        m0_fmc_dbg.last_control_id = last_control_id;
-        return 0;
     }
 
     /* A down edge is the web equivalent of one physical press.  All ten

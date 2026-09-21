@@ -36,6 +36,19 @@ function validateTelemetry(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
   return value;
 }
 
+function validateMatrixRaw(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('object');
+  if (expectedIp && sourceIp !== expectedIp) throw new Error('sourceIp');
+  if (value.type !== 'matrix.raw' || value.source !== 'fmc16' || value.mode !== 11 ||
+      value.experiment !== 'exp3-04_dot_matrix_led') throw new Error('identity');
+  if (!isUInt(value.frame_sequence, UINT32_MAX) ||
+      !isUInt(value.capture_timestamp_ms, UINT32_MAX) ||
+      value.valid_columns !== 0xffff) throw new Error('frame');
+  if (!Array.isArray(value.columns) || value.columns.length !== 16 ||
+      value.columns.some((word) => !isUInt(word, 0xffff))) throw new Error('columns');
+  return value;
+}
+
 const ENVIRONMENT_MODULES = new Set(['sht40', 'ina226_u10', 'ina226_u44', 'pcal6524']);
 
 function validateModuleData(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
@@ -124,8 +137,25 @@ class TwinStore {
     this.serverSeq = 0;
     this.epoch = 0;
     this.current = null;
+    this.matrix = null;
     this.modules = {};
-    this.stats = { accepted: 0, moduleAccepted: 0, invalid: 0, duplicate: 0, outOfOrder: 0 };
+    this.stats = { accepted: 0, matrixAccepted: 0, moduleAccepted: 0,
+      invalid: 0, duplicate: 0, outOfOrder: 0 };
+  }
+
+  acceptMatrix(packet, sourceIp, now = Date.now(), expectedIp = STM32_SOURCE_IP) {
+    let value;
+    try { value = validateMatrixRaw(packet, sourceIp, expectedIp); }
+    catch (error) { this.stats.invalid += 1; return { accepted: false, reason: error.message }; }
+    if (this.matrix && value.frame_sequence === this.matrix.frame_sequence) {
+      this.stats.duplicate += 1; return { accepted: false, reason: 'duplicate' };
+    }
+    if (this.matrix && !isNewer32(value.frame_sequence, this.matrix.frame_sequence)) {
+      this.stats.outOfOrder += 1; return { accepted: false, reason: 'outOfOrder' };
+    }
+    this.stats.matrixAccepted += 1;
+    this.matrix = { ...value, columns: [...value.columns], receivedAtMs: now };
+    return { accepted: true, matrix: this.matrix };
   }
 
   acceptModule(packet, sourceIp, now = Date.now(), expectedIp = STM32_SOURCE_IP) {
@@ -157,6 +187,7 @@ class TwinStore {
       if (restart) {
         this.epoch += 1;
         this.modules = {};
+        this.matrix = null;
       }
       else if (value.sequence === this.current.sequence) {
         this.stats.duplicate += 1; return { accepted: false, reason: 'duplicate' };
@@ -190,7 +221,14 @@ class TwinStore {
       const moduleAgeMs = Math.max(0, now - value.receivedAtMs);
       modules[name] = { ...value, ageMs: moduleAgeMs, online: moduleAgeMs <= 3000 };
     }
-    return { ...this.current, ageMs, online: freshness !== 'offline', freshness, modules };
+    let matrix = null;
+    if (this.matrix) {
+      const matrixAgeMs = Math.max(0, now - this.matrix.receivedAtMs);
+      matrix = { ...this.matrix, ageMs: matrixAgeMs,
+        fresh: matrixAgeMs <= 500, online: matrixAgeMs <= 3000 };
+    }
+    return { ...this.current, ageMs, online: freshness !== 'offline', freshness,
+      modules, matrix };
   }
 }
 
@@ -375,6 +413,14 @@ function start() {
       if (moduleResult.accepted) broadcast();
       return;
     }
+    if (packet && packet.type === 'matrix.raw') {
+      const matrixResult = store.acceptMatrix(packet, remote.address);
+      if (matrixResult.accepted) {
+        lastRemote = { address: remote.address, port: remote.port };
+        broadcast();
+      }
+      return;
+    }
     const result = store.accept(packet, remote.address);
     if (!result.accepted) return;
     lastRemote = { address: remote.address, port: remote.port };
@@ -509,4 +555,5 @@ function start() {
 
 module.exports = { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
   buildPanelControlFrame, crc16Ccitt,
-  displayModel, isNewer32, validateModuleData, validateTelemetry, start };
+  displayModel, isNewer32, validateMatrixRaw, validateModuleData,
+  validateTelemetry, start };

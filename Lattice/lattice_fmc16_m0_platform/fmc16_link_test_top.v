@@ -6,7 +6,7 @@
 // PIO LEDs, and GET_STATUS_SNAPSHOT. The large generic transaction, event,
 // cache, and multi-mode engines from fmc16_slave_top are intentionally absent.
 module fmc16_link_test_top #(
-    parameter [31:0] BUILD_ID = 32'h4C4B_0007,
+    parameter [31:0] BUILD_ID = 32'h4C4B_0009,
     parameter integer DISPLAY_CLK_DIVIDER = 25_000,
     parameter [9:0] DISPLAY_SCAN_BLANK_CYCLES = 10'd500,
     parameter integer KEY_DEBOUNCE_CYCLES = 1_000_000
@@ -49,9 +49,28 @@ module fmc16_link_test_top #(
     reg [15:0] ms_divider;
     reg [31:0] timestamp_ms;
 
+    // M11 raw matrix observer.  The XC7A platform wrapper mirrors the exact
+    // physical I_ROW drive on PIO and I_COL on PO[3:0], tagged by D4A1.
+    // Capture only after the column blanking interval.  A response freezes
+    // capture while its words are copied into the FMC packet, so STM32 never
+    // sees a buffer being changed underneath the serializer.
+    reg [15:0] matrix_snapshot [0:15];
+    reg [15:0] matrix_valid_columns;
+    reg [15:0] matrix_snapshot_valid_columns;
+    reg [31:0] matrix_frame_sequence;
+    reg [31:0] matrix_capture_timestamp_ms;
+    reg [3:0]  matrix_column_previous;
+    reg [7:0]  matrix_settle_count;
+    reg        tx_valid;
+    reg        build_active;
+    integer matrix_index;
+    wire matrix_observer_present = (po_coherent[31:16] == 16'hD4A1);
+
     // Panel F1..F10 are active-low and are reported in physical label order.
-    // M0 maps F1..F9 to toggle-event PI7..PI15. M11 maps F1..F9 to held-level
-    // PI0..PI8. F10 selects the platform profile and never consumes a PI bit.
+    // Preserve the first, hardware-verified mapping in every profile:
+    // F1..F9 toggle PI7..PI15 and F10 toggles PI6.  Keep this mapping
+    // identical in every profile; experiment-mode selection is an FMC-only
+    // platform command and must never consume a student's physical key.
     // The XO2 does not drive PI: it only publishes the
     // debounced requested value through FMC16, and the STM32 remains the
     // sole owner of the MCP23017 which physically drives XC7A PI[15:0].
@@ -65,10 +84,9 @@ module fmc16_link_test_top #(
     reg key_events_armed;
     integer key_index;
 
-    // Safe two-profile selector: M0 counter and M11/MB dot-matrix. Physical
-    // F10 toggles the two profiles; FMC opcode 0x0004 selects either one
-    // directly. F10 remains visible in key telemetry but is reserved for the
-    // platform selector and is never forwarded to the XC7A PI input path.
+    // Safe two-profile selector: M0 counter and M11/MB dot-matrix.  FMC
+    // opcode 0x0004 selects the profile directly; all ten physical keys stay
+    // transparent experiment inputs.
     reg [3:0] platform_mode;
     reg [3:0] mode_command_value;
     reg       mode_command_toggle;
@@ -107,8 +125,17 @@ module fmc16_link_test_top #(
             mode_command_seen <= 1'b0;
             key_release_count <= 22'd0;
             key_events_armed <= 1'b0;
+            matrix_valid_columns <= 16'h0000;
+            matrix_snapshot_valid_columns <= 16'h0000;
+            matrix_frame_sequence <= 32'd0;
+            matrix_capture_timestamp_ms <= 32'd0;
+            matrix_column_previous <= 4'd0;
+            matrix_settle_count <= 8'd0;
             for (key_index = 0; key_index < 10; key_index = key_index + 1)
                 key_debounce_count[key_index] <= 20'd0;
+            for (matrix_index = 0; matrix_index < 16; matrix_index = matrix_index + 1) begin
+                matrix_snapshot[matrix_index] <= 16'h0000;
+            end
         end else begin
             fmc_clk_keep   <= fmc_clk_unused;
             fmc_nwait_keep <= fmc_nwait_unused;
@@ -124,7 +151,6 @@ module fmc16_link_test_top #(
             if (mode_command_seen != mode_command_toggle) begin
                 platform_mode     <= mode_command_value;
                 mode_command_seen <= mode_command_toggle;
-                pi_requested      <= 16'h0000;
             end
 
             if (!key_events_armed) begin
@@ -149,17 +175,10 @@ module fmc16_link_test_top #(
                         key_debounce_count[key_index] <= 20'd0;
                         key_stable_n[key_index] <= key_sync_n[key_index];
                         if (!key_sync_n[key_index]) begin
-                            if (key_index == 9) begin
-                                // F10 is platform-only. Clear the previous
-                                // profile's latched experiment input events.
-                                pi_requested <= 16'h0000;
-                                if (mode_command_seen == mode_command_toggle) begin
-                                    platform_mode <= (platform_mode == 4'd0) ?
-                                                     4'd11 : 4'd0;
-                                end
-                            end
-                            else if (platform_mode != 4'd11)
+                            if (key_index <= 8)
                                 pi_requested[7 + key_index] <= ~pi_requested[7 + key_index];
+                            else
+                                pi_requested[6] <= ~pi_requested[6];
                             key_event_count <= key_event_count + 16'd1;
                         end
                     end else begin
@@ -172,6 +191,35 @@ module fmc16_link_test_top #(
                 po_coherent <= po_sample;
             if (pio_valid)
                 pio_coherent <= pio_sample;
+
+            if ((platform_mode != 4'd11) || !matrix_observer_present) begin
+                matrix_valid_columns <= 16'h0000;
+                matrix_settle_count <= 8'd0;
+                matrix_column_previous <= po_coherent[3:0];
+            end else if (build_active || tx_valid) begin
+                matrix_valid_columns <= 16'h0000;
+                matrix_settle_count <= 8'd0;
+                matrix_column_previous <= po_coherent[3:0];
+            end else if (po_coherent[3:0] != matrix_column_previous) begin
+                matrix_column_previous <= po_coherent[3:0];
+                // 100 cycles at 50 MHz exceeds the XC7A's 1 us column blank.
+                matrix_settle_count <= 8'd100;
+            end else if (matrix_settle_count != 8'd0) begin
+                matrix_settle_count <= matrix_settle_count - 1'b1;
+                if (matrix_settle_count == 8'd1) begin
+                    matrix_snapshot[matrix_column_previous] <= pio_coherent;
+                    if ((matrix_valid_columns |
+                         (16'h0001 << matrix_column_previous)) == 16'hFFFF) begin
+                        matrix_snapshot_valid_columns <= 16'hFFFF;
+                        matrix_frame_sequence <= matrix_frame_sequence + 1'b1;
+                        matrix_capture_timestamp_ms <= timestamp_ms;
+                        matrix_valid_columns <= 16'h0000;
+                    end else begin
+                        matrix_valid_columns <= matrix_valid_columns |
+                                                (16'h0001 << matrix_column_previous);
+                    end
+                end
+            end
 
             if (ms_divider == 16'd49_999) begin
                 ms_divider   <= 16'd0;
@@ -190,8 +238,9 @@ module fmc16_link_test_top #(
                                {16'h0000, po_coherent[15:0], 16'h0000} :
                            (platform_mode == 4'd6) ? {po_coherent, 16'h0000} :
                                {16'h0000, po_coherent};
-    assign LED_out = (platform_mode == 4'd1) ? ~po_coherent[27:16] :
-                                                ~pio_coherent[11:0];
+    assign LED_out = (platform_mode == 4'd11) ? 12'hFFF :
+                     (platform_mode == 4'd1) ? ~po_coherent[27:16] :
+                                               ~pio_coherent[11:0];
 
     clk_divide #(
         .DIVIDER(DISPLAY_CLK_DIVIDER)
@@ -251,12 +300,10 @@ module fmc16_link_test_top #(
     reg [15:0] tx_mem [0:31];
     reg [6:0]  tx_count;
     reg [6:0]  tx_ptr;
-    reg        tx_valid;
 
     reg [2:0]  build_kind;
     reg [6:0]  build_total;
     reg [6:0]  build_idx;
-    reg        build_active;
     // Two-phase packet construction: prime build_word_q first, then consume
     // it on the following clock for tx_mem and CRC updates.  Keeping the
     // decoder and CRC in separate register-to-register paths removes the
@@ -348,7 +395,8 @@ module fmc16_link_test_top #(
                 K_RESET: payload_words_for_kind = 5'd8;
                 K_HELLO: payload_words_for_kind = 5'd11;
                 K_INFO : payload_words_for_kind = 5'd16;
-                K_RESP : payload_words_for_kind = (build_opcode == 16'h0003) ? 5'd14 : 5'd10;
+                K_RESP : payload_words_for_kind = (build_opcode == 16'h0005) ? 5'd17 :
+                                                  (build_opcode == 16'h0003) ? 5'd14 : 5'd10;
                 default: payload_words_for_kind = 5'd4;
             endcase
         end
@@ -416,7 +464,31 @@ module fmc16_link_test_top #(
                     endcase
                 end
                 K_RESP: begin
-                    if (build_opcode == 16'h0003) begin
+                    if (build_opcode == 16'h0005) begin
+                        case (pidx)
+                            7'd0:  body_word = build_opcode;
+                            7'd1:  body_word = build_status;
+                            7'd2:  body_word = 16'h0000;
+                            7'd3:  body_word = 16'd13;
+                            7'd4:  body_word = (matrix_observer_present ? 16'h8000 : 16'h0000) |
+                                                   ((matrix_snapshot_valid_columns == 16'hFFFF) ? 16'h4000 : 16'h0000) |
+                                                   (build_detail[0] ? 16'h0100 : 16'h0000) |
+                                                   {12'h000, platform_mode};
+                            7'd5:  body_word = matrix_snapshot_valid_columns;
+                            7'd6:  body_word = matrix_frame_sequence[31:16];
+                            7'd7:  body_word = matrix_frame_sequence[15:0];
+                            7'd8:  body_word = build_detail[0] ? matrix_snapshot[8]  : matrix_snapshot[0];
+                            7'd9:  body_word = build_detail[0] ? matrix_snapshot[9]  : matrix_snapshot[1];
+                            7'd10: body_word = build_detail[0] ? matrix_snapshot[10] : matrix_snapshot[2];
+                            7'd11: body_word = build_detail[0] ? matrix_snapshot[11] : matrix_snapshot[3];
+                            7'd12: body_word = build_detail[0] ? matrix_snapshot[12] : matrix_snapshot[4];
+                            7'd13: body_word = build_detail[0] ? matrix_snapshot[13] : matrix_snapshot[5];
+                            7'd14: body_word = build_detail[0] ? matrix_snapshot[14] : matrix_snapshot[6];
+                            7'd15: body_word = build_detail[0] ? matrix_snapshot[15] : matrix_snapshot[7];
+                            7'd16: body_word = matrix_capture_timestamp_ms[15:0];
+                            default: body_word = 16'h0000;
+                        endcase
+                    end else if (build_opcode == 16'h0003) begin
                         case (pidx)
                             7'd0:  body_word = build_opcode;
                             7'd1:  body_word = build_status;
@@ -428,12 +500,9 @@ module fmc16_link_test_top #(
                                                    (pio_valid ? 16'h0004 : 16'h0000) |
                                                    (fmc_clk_keep ? 16'h0100 : 16'h0000) |
                                                    (fmc_nwait_keep ? 16'h0200 : 16'h0000);
-                            // M0 uses the legacy toggle-event convention.
-                            // M11 presents the debounced held level because
-                            // the unmodified dot-matrix RTL detects PI rises.
-                            7'd6:  body_word = (platform_mode == 4'd11) ?
-                                                   {7'h00, ~key_stable_n[8:0]} :
-                                                   pi_requested;
+                            // Every profile uses the same latched-toggle PI
+                            // convention, matching the proven M0 dataplane.
+                            7'd6:  body_word = pi_requested;
                             7'd7:  body_word = {6'h00, ~key_stable_n};
                             7'd8:  body_word = {platform_mode, key_event_count[11:0]};
                             7'd9:  body_word = po_coherent[31:16];
@@ -648,7 +717,8 @@ module fmc16_link_test_top #(
                     end
                     else if (build_kind == K_ACK && pending_response) begin
                         build_kind   <= K_RESP;
-                        build_total  <= (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
+                        build_total  <= (pending_opcode == 16'h0005) ? 7'd32 :
+                                        (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
                         build_seq    <= tx_seq;
                         build_tid    <= pending_tid;
                         build_opcode <= pending_opcode;
@@ -679,7 +749,8 @@ module fmc16_link_test_top #(
                         end
                         else begin
                             build_kind   <= K_RESP;
-                            build_total  <= (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
+                            build_total  <= (pending_opcode == 16'h0005) ? 7'd32 :
+                                            (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
                     build_opcode <= pending_opcode;
                             build_status <= pending_status;
                             build_detail <= pending_detail;
@@ -720,7 +791,8 @@ module fmc16_link_test_top #(
                 end
                 else begin
                     build_kind       <= K_RESP;
-                    build_total      <= (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
+                    build_total      <= (pending_opcode == 16'h0005) ? 7'd32 :
+                                        (pending_opcode == 16'h0003) ? 7'd29 : 7'd25;
                     build_opcode     <= pending_opcode;
                     build_status     <= pending_status;
                     build_detail     <= pending_detail;
@@ -844,19 +916,23 @@ module fmc16_link_test_top #(
                             (rx_source_dest == 16'h0001) &&
                             (rx_channel == 16'h0002) &&
                             ((rx_opcode == 16'h0001) || (rx_opcode == 16'h0003) ||
-                             (rx_opcode == 16'h0004)) &&
+                             (rx_opcode == 16'h0004) || (rx_opcode == 16'h0005)) &&
                             (rx_schema == 16'h0100) &&
                             (((rx_opcode == 16'h0004) &&
                               (rx_options[15:4] == 12'h000) &&
                               ((rx_options[3:0] == 4'd0) ||
                                (rx_options[3:0] == 4'd11))) ||
-                             ((rx_opcode != 16'h0004) &&
+                             ((rx_opcode == 16'h0005) &&
+                              (rx_options[15:1] == 15'h0000)) ||
+                             (((rx_opcode != 16'h0004) &&
+                               (rx_opcode != 16'h0005)) &&
                               (rx_options == 16'h0000))) &&
                             ({rx_crc_hi, rx_word} == rx_crc32)) begin
                             pending_tid      <= rx_tid;
                             pending_opcode   <= rx_opcode;
                             pending_status   <= 16'h0000;
-                            pending_detail   <= 16'h0000;
+                            pending_detail   <= (rx_opcode == 16'h0005) ?
+                                                rx_options : 16'h0000;
                             pending_response <= 1'b1;
                             pending_ack      <= rx_type_flags[0];
                             if (rx_opcode == 16'h0004) begin
@@ -869,7 +945,8 @@ module fmc16_link_test_top #(
                             pending_opcode <= rx_opcode;
                             pending_status <= ((rx_opcode == 16'h0001) ||
                                                (rx_opcode == 16'h0003) ||
-                                               (rx_opcode == 16'h0004)) ? 16'h0009 : 16'h0002;
+                                               (rx_opcode == 16'h0004) ||
+                                               (rx_opcode == 16'h0005)) ? 16'h0009 : 16'h0002;
                             pending_detail <= 16'h0000;
                             pending_nack   <= 1'b1;
                         end
