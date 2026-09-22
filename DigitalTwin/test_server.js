@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('assert');
+const matrixState = require('./public/matrix_state');
 const { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
   buildPanelControlFrame, crc16Ccitt,
   displayModel, isNewer32, validateMatrixRaw, validateModuleData } = require('./server');
@@ -111,4 +112,20 @@ assert.strictEqual(panelSent[0][5],2);
 assert.strictEqual(pq.acknowledge(200,2100),true);
 assert.strictEqual(pq.enqueue('mode',11,0,2200).target,'mode');
 assert.strictEqual(panelSent[1][5],3);
+const m11=matrixState.decodeM11(0xD4B08B7A);
+assert.strictEqual(m11.valid,true);
+assert.strictEqual(m11.running,true);
+assert.strictEqual(m11.patternMode,3);
+assert.strictEqual(m11.speed,0);
+assert.strictEqual(m11.framePos,0x8b);
+assert.strictEqual(m11.scanHeartbeat,7);
+assert.strictEqual(m11.scanRow,10);
+const m11Rows=matrixState.renderPattern(m11);
+assert.strictEqual(m11Rows.length,16);
+assert.strictEqual(m11Rows[13],0xff00);
+assert.strictEqual(matrixState.decodeM11(0x12345678).valid,false);
+const bounce=matrixState.decodeM11(0xD490016C);
+assert.strictEqual(bounce.patternMode,1);
+const bounceRows=matrixState.renderPattern(bounce);
+assert.strictEqual(bounceRows[14],0x2000);
 console.log('Digital twin tests: ALL PASS');

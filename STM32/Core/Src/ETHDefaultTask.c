@@ -28,8 +28,6 @@ extern struct netif gnetif;
 #define ETH_PANEL_TARGET_BUZZER   2U
 #define ETH_PANEL_TARGET_MODE     3U
 #define ETH_ENVIRONMENT_PERIOD_MS 1000U
-/* The restored dual-mode Lattice image has no raw-matrix opcode. */
-#define ETH_MATRIX_RAW_ENABLED    0U
 
 typedef struct
 {
@@ -39,10 +37,6 @@ typedef struct
     uint32_t send_count;
     uint32_t send_error_count;
     uint32_t fmc_read_error_count;
-    uint32_t matrix_read_error_count;
-    uint32_t matrix_send_count;
-    uint32_t matrix_send_error_count;
-    uint32_t last_matrix_sequence;
     uint32_t environment_send_count;
     uint32_t environment_send_error_count;
     uint32_t last_environment_sequence;
@@ -322,11 +316,25 @@ static void ETH_PollControl(int sock,
                 eth_task_dbg.control_reject_count++;
                 continue;
             }
-            /* F10 is an ordinary key, not an experiment-mode selector. */
-            result = M0_DataSource_VirtualKeySet(
-                packet[5],
-                (packet[6] == ETH_CONTROL_ACTION_DOWN) ? 1U : 0U,
-                command_id);
+            if ((packet[5] == 10U) &&
+                (packet[6] == ETH_CONTROL_ACTION_DOWN))
+            {
+                uint8_t next_mode;
+                int32_t mode_result;
+
+                next_mode = (m0_fmc_dbg.current_mode == 0U) ? 11U : 0U;
+                mode_result = BoardPanel_SetMode(next_mode, command_id);
+                result = (mode_result >= 0) ?
+                    M0_DataSource_VirtualKeySet(10U, 1U, command_id) :
+                    mode_result;
+            }
+            else
+            {
+                result = M0_DataSource_VirtualKeySet(
+                    packet[5],
+                    (packet[6] == ETH_CONTROL_ACTION_DOWN) ? 1U : 0U,
+                    command_id);
+            }
         }
         else if ((packet[5] == ETH_PANEL_TARGET_SWITCH) &&
                  (packet[7] <= 1U))
@@ -427,39 +435,6 @@ static int ETH_FormatM0Payload(const M0_DataSnapshot *snapshot,
         (unsigned int)snapshot->pio);
 }
 
-static int ETH_FormatMatrixPayload(const M0_MatrixSnapshot *snapshot,
-                                   char *payload,
-                                   size_t payload_size)
-{
-    return snprintf(
-        payload, payload_size,
-        "{\"type\":\"matrix.raw\",\"experiment\":\"exp3-04_dot_matrix_led\","
-        "\"source\":\"fmc16\",\"mode\":%u,\"frame_sequence\":%lu,"
-        "\"capture_timestamp_ms\":%lu,\"valid_columns\":%u,"
-        "\"columns\":[%u,%u,%u,%u,%u,%u,%u,%u,"
-        "%u,%u,%u,%u,%u,%u,%u,%u]}",
-        (unsigned int)snapshot->mode,
-        (unsigned long)snapshot->frame_sequence,
-        (unsigned long)snapshot->capture_timestamp_ms,
-        (unsigned int)snapshot->valid_columns,
-        (unsigned int)snapshot->columns[0],
-        (unsigned int)snapshot->columns[1],
-        (unsigned int)snapshot->columns[2],
-        (unsigned int)snapshot->columns[3],
-        (unsigned int)snapshot->columns[4],
-        (unsigned int)snapshot->columns[5],
-        (unsigned int)snapshot->columns[6],
-        (unsigned int)snapshot->columns[7],
-        (unsigned int)snapshot->columns[8],
-        (unsigned int)snapshot->columns[9],
-        (unsigned int)snapshot->columns[10],
-        (unsigned int)snapshot->columns[11],
-        (unsigned int)snapshot->columns[12],
-        (unsigned int)snapshot->columns[13],
-        (unsigned int)snapshot->columns[14],
-        (unsigned int)snapshot->columns[15]);
-}
-
 static int ETH_SendEnvironmentPacket(int sock,
                                      const struct sockaddr_in *server_addr,
                                      const char *module,
@@ -496,7 +471,7 @@ static int ETH_SendEnvironment(int sock,
 {
     BoardMonitorSnapshot monitor;
     BoardPanelSnapshot panel;
-    char data_json[384];
+    char data_json[256];
     int length;
 
     if ((module_sequence == NULL) ||
@@ -578,11 +553,7 @@ static int ETH_SendEnvironment(int sock,
         length = snprintf(data_json, sizeof(data_json),
             "{\"sw\":%u,\"yds\":%u,\"eth_link\":%u,"
             "\"usb_active\":%u,\"buzzer_mute\":%u,"
-            "\"alarm_level\":%u,\"valid\":%u,\"last_result\":%ld,"
-            "\"cfg_state\":%u,\"cfg_i2c\":%ld,\"cfg_tries\":%lu,"
-            "\"program_b\":%lu,\"init_b\":%lu,\"done\":%lu,"
-            "\"mux\":%lu,\"mode_out\":%u,\"mode_cfg\":%u,"
-            "\"pi_i2c\":%ld,\"pi_ready\":%lu,\"cfg_runs\":%lu}",
+            "\"alarm_level\":%u,\"valid\":%u,\"last_result\":%ld}",
             (unsigned int)panel.switch_bitmap,
             (unsigned int)panel.yds_bitmap,
             (unsigned int)((netif_is_up(&gnetif) &&
@@ -591,19 +562,7 @@ static int ETH_SendEnvironment(int sock,
             (unsigned int)panel.buzzer_mute,
             (unsigned int)panel.alarm_level,
             (unsigned int)panel.valid,
-            (long)board_panel_dbg.last_result,
-            (unsigned int)fpga_autoconfig_dbg.state,
-            (long)fpga_autoconfig_dbg.i2c_result,
-            (unsigned long)fpga_autoconfig_dbg.config_attempts,
-            (unsigned long)fpga_autoconfig_dbg.program_b,
-            (unsigned long)fpga_autoconfig_dbg.init_b,
-            (unsigned long)fpga_autoconfig_dbg.done,
-            (unsigned long)fpga_autoconfig_dbg.mux_enabled,
-            (unsigned int)fpga_autoconfig_dbg.pcal_out1,
-            (unsigned int)fpga_autoconfig_dbg.pcal_cfg1,
-            (long)fpga_autoconfig_dbg.pi_i2c_result,
-            (unsigned long)fpga_autoconfig_dbg.pi_ready,
-            (unsigned long)fpga_autoconfig_dbg.run_count);
+            (long)board_panel_dbg.last_result);
         if ((length <= 0) || ((size_t)length >= sizeof(data_json)) ||
             (ETH_SendEnvironmentPacket(sock, server_addr, "pcal6524",
                  ++(*module_sequence), panel.timestamp_ms, data_json,
@@ -630,10 +589,8 @@ void ETHDefaultTask(void const *argument)
     char payload[448];
     struct sockaddr_in server_addr;
     M0_DataSnapshot snapshot;
-    M0_MatrixSnapshot matrix_snapshot;
     BoardPanelSnapshot panel_snapshot;
     uint8_t have_snapshot = 0U;
-    uint8_t have_matrix_snapshot = 0U;
     uint32_t snapshot_count = 0U;
     uint32_t next_publish_ms;
     uint32_t next_environment_ms;
@@ -739,18 +696,6 @@ void ETHDefaultTask(void const *argument)
         have_snapshot = 1U;
         snapshot_count++;
         eth_task_dbg.last_fmc_result = M0_FMC_OK;
-        have_matrix_snapshot = 0U;
-        if ((ETH_MATRIX_RAW_ENABLED != 0U) && (snapshot.mode == 11U))
-        {
-            if (M0_DataSource_ReadMatrix(&matrix_snapshot) != 0U)
-            {
-                have_matrix_snapshot = 1U;
-            }
-            else
-            {
-                eth_task_dbg.matrix_read_error_count++;
-            }
-        }
         /* Physical F10 changes the XO2 mode without going through the web.
          * Reconcile the external BSW route only when that mode actually
          * changes.  Reapplying the route on every snapshot would overwrite
@@ -824,9 +769,6 @@ void ETHDefaultTask(void const *argument)
         }
         else
         {
-            int matrix_len;
-            int matrix_sent;
-
             eth_task_dbg.last_errno = 0;
             eth_task_dbg.send_count++;
             /* FMC/UDP keeps its 100 ms cadence, but a human-readable LCD
@@ -839,42 +781,8 @@ void ETHDefaultTask(void const *argument)
                                   eth_task_dbg.send_error_count);
             }
 
-            if ((have_matrix_snapshot != 0U) &&
-                (matrix_snapshot.frame_sequence !=
-                 eth_task_dbg.last_matrix_sequence))
-            {
-                matrix_len = ETH_FormatMatrixPayload(
-                    &matrix_snapshot, payload, sizeof(payload));
-                if ((matrix_len <= 0) ||
-                    ((size_t)matrix_len >= sizeof(payload)))
-                {
-                    eth_task_dbg.matrix_send_error_count++;
-                }
-                else
-                {
-                    matrix_sent = lwip_sendto(
-                        sock, payload, (size_t)matrix_len, 0,
-                        (const struct sockaddr *)&server_addr,
-                        sizeof(server_addr));
-                    if (matrix_sent == matrix_len)
-                    {
-                        eth_task_dbg.matrix_send_count++;
-                        eth_task_dbg.last_matrix_sequence =
-                            matrix_snapshot.frame_sequence;
-                    }
-                    else
-                    {
-                        eth_task_dbg.matrix_send_error_count++;
-                        eth_task_dbg.last_errno = errno;
-                        lwip_close(sock);
-                        sock = -1;
-                    }
-                }
-            }
-
             now_ms = HAL_GetTick();
-            if ((sock >= 0) &&
-                ((int32_t)(now_ms - next_environment_ms) >= 0))
+            if ((int32_t)(now_ms - next_environment_ms) >= 0)
             {
                 environment_result = ETH_SendEnvironment(
                     sock, &server_addr, &module_sequence,

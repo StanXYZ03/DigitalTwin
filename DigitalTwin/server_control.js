@@ -377,6 +377,7 @@ function websocketFrame(text) {
 function start() {
   const store = new TwinStore();
   const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
+  const matrixStateJs = fs.readFileSync(path.join(__dirname, 'public', 'matrix_state.js'));
   const udp = dgram.createSocket('udp4');
   let lastRemote = null;
   let controls;
@@ -525,6 +526,10 @@ function start() {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(html); return;
+    }
+    if (req.method === 'GET' && req.url === '/matrix_state.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(matrixStateJs); return;
     }
     res.writeHead(404); res.end('Not found');
   });
