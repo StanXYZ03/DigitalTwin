@@ -63,6 +63,7 @@ int32_t BoardPanel_SetSwitch(uint8_t b_number, uint8_t on,
                              uint32_t command_id);
 int32_t BoardPanel_SetBuzzerMute(uint8_t mute, uint32_t command_id);
 int32_t BoardPanel_SetMode(uint8_t mode, uint32_t command_id);
+int32_t BoardPanel_AcknowledgeSystemReset(uint32_t command_id);
 int32_t BoardPanel_ApplyModeRoute(uint8_t mode);
 void BoardPanel_NotifyUsbActivity(void);
 

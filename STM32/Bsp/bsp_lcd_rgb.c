@@ -453,6 +453,12 @@ void LCD_RGB_InitPanelOnly(void)
         LCD_RGB_InitBacklightGPIO();
     }
 
+#if (LCD_PANEL_SERIAL_INIT_ENABLE == 0U)
+    /* Keep PH6/TMS passive.  LTDC, framebuffer and backlight remain enabled;
+       the panel runs from its hardware power-on register defaults. */
+    return;
+#endif
+
     if (s_panel_init_deferred != 0U)
     {
         return;

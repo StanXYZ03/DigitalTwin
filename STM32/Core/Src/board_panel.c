@@ -499,6 +499,22 @@ int32_t BoardPanel_SetMode(uint8_t mode, uint32_t command_id)
     return 0;
 }
 
+int32_t BoardPanel_AcknowledgeSystemReset(uint32_t command_id)
+{
+    if (command_id == 0U)
+        return -1;
+    if (command_id == board_panel_snapshot.control_ack)
+        return 1;
+
+    /* This function only records acceptance.  ETHDefaultTask performs the
+     * reset after a telemetry packet carrying this ACK has been sent. */
+    taskENTER_CRITICAL();
+    board_panel_snapshot.control_ack = command_id;
+    board_panel_dbg.last_control_id = command_id;
+    taskEXIT_CRITICAL();
+    return 0;
+}
+
 int32_t BoardPanel_ApplyModeRoute(uint8_t mode)
 {
     uint16_t desired;

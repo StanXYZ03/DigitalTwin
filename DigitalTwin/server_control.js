@@ -49,6 +49,18 @@ function validateMatrixRaw(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
   return value;
 }
 
+function validateJtagMaintenance(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('object');
+  if (expectedIp && sourceIp !== expectedIp) throw new Error('sourceIp');
+  if (value.type !== 'jtag.maintenance' || value.source !== 'stm32h743' ||
+      value.state !== 'ready') throw new Error('identity');
+  if (!isUInt(value.sequence, UINT32_MAX) ||
+      !isUInt(value.timestamp_ms, UINT32_MAX)) throw new Error('sequence');
+  if (!isUInt(value.panel_control_ack, UINT32_MAX) ||
+      !isUInt(value.fpga_done, 1)) throw new Error('state');
+  return value;
+}
+
 const ENVIRONMENT_MODULES = new Set(['sht40', 'ina226_u10', 'ina226_u44', 'pcal6524']);
 
 function validateModuleData(value, sourceIp, expectedIp = STM32_SOURCE_IP) {
@@ -113,16 +125,21 @@ function buildControlFrame(key, action, commandId) {
 }
 
 function buildPanelControlFrame(target, index, value, commandId) {
-  if (target !== 'switch' && target !== 'buzzer' && target !== 'mode') throw new Error('target');
+  if (target !== 'switch' && target !== 'buzzer' && target !== 'mode' && target !== 'reset' && target !== 'jtag') throw new Error('target');
   if (target === 'switch' && (!Number.isInteger(index) || index < 1 || index > 14 || index === 10)) throw new Error('switch');
   if (target === 'buzzer' && index !== 0) throw new Error('index');
   if (target === 'mode' && (index !== 0 && index !== 11)) throw new Error('mode');
-  if (target === 'mode' ? value !== 0 : (value !== 0 && value !== 1)) throw new Error('value');
+  if (target === 'reset' && index !== 0) throw new Error('index');
+  if (target === 'jtag' && index !== 0) throw new Error('index');
+  if (target === 'mode' ? value !== 0 :
+      target === 'reset' ? value !== 0xa5 :
+      target === 'jtag' ? (value !== 0x5a && value !== 0xa6) :
+      (value !== 0 && value !== 1)) throw new Error('value');
   if (!isUInt(commandId, UINT32_MAX) || commandId === 0) throw new Error('commandId');
   const frame = Buffer.alloc(16);
   frame.write('M0PC', 0, 'ascii');
   frame[4] = 1;
-  frame[5] = target === 'switch' ? 1 : target === 'buzzer' ? 2 : 3;
+  frame[5] = target === 'switch' ? 1 : target === 'buzzer' ? 2 : target === 'mode' ? 3 : target === 'reset' ? 4 : 5;
   frame[6] = index;
   frame[7] = value;
   frame.writeUInt32BE(commandId >>> 0, 8);
@@ -137,10 +154,28 @@ class TwinStore {
     this.serverSeq = 0;
     this.epoch = 0;
     this.current = null;
+    this.maintenance = null;
     this.matrix = null;
     this.modules = {};
     this.stats = { accepted: 0, matrixAccepted: 0, moduleAccepted: 0,
+      maintenanceAccepted: 0,
       invalid: 0, duplicate: 0, outOfOrder: 0 };
+  }
+
+  acceptMaintenance(packet, sourceIp, now = Date.now(), expectedIp = STM32_SOURCE_IP) {
+    let value;
+    try { value = validateJtagMaintenance(packet, sourceIp, expectedIp); }
+    catch (error) { this.stats.invalid += 1; return { accepted: false, reason: error.message }; }
+    if (this.maintenance && value.sequence === this.maintenance.sequence) {
+      this.stats.duplicate += 1; return { accepted: false, reason: 'duplicate' };
+    }
+    if (this.maintenance && !isNewer32(value.sequence, this.maintenance.sequence)) {
+      this.stats.outOfOrder += 1; return { accepted: false, reason: 'outOfOrder' };
+    }
+    this.serverSeq += 1;
+    this.stats.maintenanceAccepted += 1;
+    this.maintenance = { ...value, receivedAtMs: now };
+    return { accepted: true, snapshot: this.snapshot(now) };
   }
 
   acceptMatrix(packet, sourceIp, now = Date.now(), expectedIp = STM32_SOURCE_IP) {
@@ -179,7 +214,12 @@ class TwinStore {
     try { value = validateTelemetry(packet, sourceIp, expectedIp); }
     catch (error) { this.stats.invalid += 1; return { accepted: false, reason: error.message }; }
 
-    if (this.current) {
+    if (this.current && this.maintenance) {
+      /* A normal packet after maintenance is a new boot even if counters reset quickly. */
+      this.epoch += 1;
+      this.modules = {};
+      this.matrix = null;
+    } else if (this.current) {
       const silence = now - this.current.receivedAtMs;
       const timestampRollback = this.current.timestamp_ms - value.timestamp_ms;
       const bothWentBack = value.sequence < this.current.sequence && timestampRollback > 1000;
@@ -198,6 +238,7 @@ class TwinStore {
 
     this.serverSeq += 1;
     this.stats.accepted += 1;
+    this.maintenance = null;
     this.current = {
       ...value,
       type: 'digitalTwin.snapshot', deviceId: this.deviceId,
@@ -213,8 +254,11 @@ class TwinStore {
   }
 
   snapshot(now = Date.now()) {
-    if (!this.current) return null;
-    const ageMs = Math.max(0, now - this.current.receivedAtMs);
+    if (!this.current && !this.maintenance) return null;
+    const normalAgeMs = this.current ? Math.max(0, now - this.current.receivedAtMs) : Infinity;
+    const maintenanceAgeMs = this.maintenance ? Math.max(0, now - this.maintenance.receivedAtMs) : Infinity;
+    const maintenanceOnline = maintenanceAgeMs <= 3000;
+    const ageMs = maintenanceOnline ? maintenanceAgeMs : normalAgeMs;
     const freshness = ageMs > 3000 ? 'offline' : (ageMs > 500 ? 'stale' : 'fresh');
     const modules = {};
     for (const [name, value] of Object.entries(this.modules)) {
@@ -227,8 +271,19 @@ class TwinStore {
       matrix = { ...this.matrix, ageMs: matrixAgeMs,
         fresh: matrixAgeMs <= 500, online: matrixAgeMs <= 3000 };
     }
-    return { ...this.current, ageMs, online: freshness !== 'offline', freshness,
-      modules, matrix };
+    const base = this.current || {
+      type: 'digitalTwin.snapshot', deviceId: this.deviceId, deviceEpoch: this.epoch,
+      sequence: 0, timestamp_ms: 0, mode: 0, experiment: 'JTAG maintenance',
+      po: 0, pio: 0, display: displayModel(0, 0),
+      physicalKeys: Array(10).fill(false), virtualKeys: Array(10).fill(false),
+      keys: Array(10).fill(false)
+    };
+    const maintenance = this.maintenance ? { ...this.maintenance,
+      ageMs: maintenanceAgeMs, online: maintenanceOnline } : null;
+    return { ...base, serverSeq: this.serverSeq, ageMs,
+      online: freshness !== 'offline', freshness,
+      systemState: maintenanceOnline ? 'jtag-maintenance' : 'normal',
+      maintenance, modules, matrix };
   }
 }
 
@@ -422,6 +477,16 @@ function start() {
       }
       return;
     }
+    if (packet && packet.type === 'jtag.maintenance') {
+      const maintenanceResult = store.acceptMaintenance(packet, remote.address);
+      if (maintenanceResult.accepted) {
+        /* The STM32 resets when entering maintenance, so its UDP source port can change. */
+        lastRemote = { address: remote.address, port: remote.port };
+        if (packet.panel_control_ack) panelControls.acknowledge(packet.panel_control_ack);
+        broadcast();
+      }
+      return;
+    }
     const result = store.accept(packet, remote.address);
     if (!result.accepted) return;
     lastRemote = { address: remote.address, port: remote.port };
@@ -442,7 +507,7 @@ function start() {
     const keyMatch = req.url.match(new RegExp(`^/api/digital-twin/devices/${DEVICE_ID}/keys/F(10|[1-9])/(down|up)$`));
     if (req.method === 'POST' && keyMatch) {
       const snapshot = store.snapshot();
-      if (!lastRemote || !snapshot || !snapshot.online) {
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
         res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'deviceOffline' })); return;
       }
@@ -462,7 +527,7 @@ function start() {
     const switchMatch = req.url.match(new RegExp(`^/api/digital-twin/devices/${DEVICE_ID}/switches/B(1[0-4]|[1-9])/(on|off)$`));
     if (req.method === 'POST' && switchMatch) {
       const snapshot = store.snapshot();
-      if (!lastRemote || !snapshot || !snapshot.online) {
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
         res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'deviceOffline' })); return;
       }
@@ -484,7 +549,7 @@ function start() {
     const buzzerMatch = req.url.match(new RegExp(`^/api/digital-twin/devices/${DEVICE_ID}/buzzer/(mute|unmute)$`));
     if (req.method === 'POST' && buzzerMatch) {
       const snapshot = store.snapshot();
-      if (!lastRemote || !snapshot || !snapshot.online) {
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
         res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'deviceOffline' })); return;
       }
@@ -505,7 +570,7 @@ function start() {
     const modeMatch = req.url.match(new RegExp(`^/api/digital-twin/devices/${DEVICE_ID}/modes/M(0|11)$`));
     if (req.method === 'POST' && modeMatch) {
       const snapshot = store.snapshot();
-      if (!lastRemote || !snapshot || !snapshot.online) {
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
         res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'deviceOffline' })); return;
       }
@@ -515,6 +580,68 @@ function start() {
         res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ status: 'queued', commandId: command.id,
           mode: `M${mode}` }));
+      } catch (error) {
+        res.writeHead(error.message === 'queueFull' ? 429 : 400,
+          { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: error.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' &&
+        req.url === `/api/digital-twin/devices/${DEVICE_ID}/system/reset`) {
+      const snapshot = store.snapshot();
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'deviceOffline' })); return;
+      }
+      try {
+        /* 0xA5 is an explicit intent marker checked again by STM32. */
+        const command = panelControls.enqueue('reset', 0, 0xa5);
+        res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ status: 'queued', commandId: command.id,
+          reset: 'soft' }));
+      } catch (error) {
+        res.writeHead(error.message === 'queueFull' ? 429 : 400,
+          { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: error.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' &&
+        req.url === `/api/digital-twin/devices/${DEVICE_ID}/system/jtag-maintenance`) {
+      const snapshot = store.snapshot();
+      if (!lastRemote || !snapshot || !snapshot.online || snapshot.systemState !== 'normal') {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'deviceOffline' })); return;
+      }
+      try {
+        const command = panelControls.enqueue('jtag', 0, 0x5a);
+        res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ status: 'queued', commandId: command.id,
+          mode: 'jtag-maintenance' }));
+      } catch (error) {
+        res.writeHead(error.message === 'queueFull' ? 429 : 400,
+          { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: error.message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' &&
+        req.url === `/api/digital-twin/devices/${DEVICE_ID}/system/jtag-maintenance/exit`) {
+      const snapshot = store.snapshot();
+      if (!lastRemote || !snapshot || !snapshot.online ||
+          snapshot.systemState !== 'jtag-maintenance') {
+        res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'notInJtagMaintenance' })); return;
+      }
+      try {
+        const command = panelControls.enqueue('jtag', 0, 0xa6);
+        res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ status: 'queued', commandId: command.id,
+          mode: 'normal-preserve-fpga' }));
       } catch (error) {
         res.writeHead(error.message === 'queueFull' ? 429 : 400,
           { 'Content-Type': 'application/json; charset=utf-8' });
@@ -561,4 +688,4 @@ function start() {
 module.exports = { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
   buildPanelControlFrame, crc16Ccitt,
   displayModel, isNewer32, validateMatrixRaw, validateModuleData,
-  validateTelemetry, start };
+  validateJtagMaintenance, validateTelemetry, start };

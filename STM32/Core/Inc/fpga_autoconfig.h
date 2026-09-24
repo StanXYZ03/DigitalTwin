@@ -35,6 +35,11 @@ typedef struct
   volatile uint32_t pi_ready;
   volatile uint32_t pi_first_done;
   volatile uint32_t pi_last_value;
+  volatile uint32_t jtag_release_count;
+  volatile uint32_t pc10_mode;
+  volatile uint32_t pc11_mode;
+  volatile uint32_t pc12_mode;
+  volatile uint32_t ph6_mode;
 } FPGA_AutoConfigDebug;
 
 extern volatile FPGA_AutoConfigDebug fpga_autoconfig_dbg;
@@ -49,6 +54,13 @@ HAL_StatusTypeDef FPGA_ConfigModeHold_Run(void);
  * connector to a passive state.  A future MCU-JTAG service may claim these
  * pins temporarily and must call this again when it exits. */
 void FPGA_ExternalJtagRelease(void);
+void FPGA_ExternalJtagFullIsolation(void);
+void FPGA_JtagMaintenanceArm(void);
+uint8_t FPGA_JtagMaintenanceConsumeRequest(void);
+uint8_t FPGA_JtagMaintenanceIsActive(void);
+void FPGA_JtagPreserveOnNextBootArm(void);
+uint8_t FPGA_JtagPreserveConsumeRequest(void);
+uint8_t FPGA_JtagPreserveBootIsActive(void);
 
 /* The PI expander shares PB7/PB8 with the configuration-mode expander.
  * FPGA_AutoConfig_Run establishes PI=0 before it asserts PROGRAM_B. */

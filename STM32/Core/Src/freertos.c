@@ -13,6 +13,7 @@
 #include "cmsis_os.h"
 #include "board_monitor.h"
 #include "board_panel.h"
+#include "fpga_autoconfig.h"
 
 osThreadId ETHHandle;
 osThreadId BoardMonitorHandle;
@@ -35,8 +36,11 @@ void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer,
 
 void MX_FREERTOS_Init(void)
 {
-    BoardMonitor_Init();
-    BoardPanel_Init();
+    if (FPGA_JtagMaintenanceIsActive() == 0U)
+    {
+        BoardMonitor_Init();
+        BoardPanel_Init();
+    }
 
     osThreadDef(ETH, ETHDefaultTask, osPriorityBelowNormal, 0, 2048);
     ETHHandle = osThreadCreate(osThread(ETH), NULL);
@@ -48,22 +52,25 @@ void MX_FREERTOS_Init(void)
         Error_Handler();
     }
 
-    osThreadDef(BoardMonitor, BoardMonitorTask, osPriorityLow, 0, 768);
-    BoardMonitorHandle = osThreadCreate(osThread(BoardMonitor), NULL);
-    if (BoardMonitorHandle == NULL)
+    if (FPGA_JtagMaintenanceIsActive() == 0U)
     {
-        fault_dbg.reason = 23U;
-        fault_dbg.count++;
-        Error_Handler();
-    }
+        osThreadDef(BoardMonitor, BoardMonitorTask, osPriorityLow, 0, 768);
+        BoardMonitorHandle = osThreadCreate(osThread(BoardMonitor), NULL);
+        if (BoardMonitorHandle == NULL)
+        {
+            fault_dbg.reason = 23U;
+            fault_dbg.count++;
+            Error_Handler();
+        }
 
-    osThreadDef(BoardPanel, BoardPanelTask, osPriorityLow, 0, 768);
-    BoardPanelHandle = osThreadCreate(osThread(BoardPanel), NULL);
-    if (BoardPanelHandle == NULL)
-    {
-        fault_dbg.reason = 24U;
-        fault_dbg.count++;
-        Error_Handler();
+        osThreadDef(BoardPanel, BoardPanelTask, osPriorityLow, 0, 768);
+        BoardPanelHandle = osThreadCreate(osThread(BoardPanel), NULL);
+        if (BoardPanelHandle == NULL)
+        {
+            fault_dbg.reason = 24U;
+            fault_dbg.count++;
+            Error_Handler();
+        }
     }
 }
 

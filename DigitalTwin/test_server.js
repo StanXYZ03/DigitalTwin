@@ -3,7 +3,8 @@ const assert = require('assert');
 const matrixState = require('./public/matrix_state');
 const { ControlQueue, PanelControlQueue, TwinStore, buildControlFrame,
   buildPanelControlFrame, crc16Ccitt,
-  displayModel, isNewer32, validateMatrixRaw, validateModuleData } = require('./server');
+  displayModel, isNewer32, validateJtagMaintenance, validateMatrixRaw,
+  validateModuleData } = require('./server');
 
 function packet(sequence=1, timestamp_ms=100, po=0, pio=0) {
   return { type:'telemetry', experiment:'exp2-01_hex_counter_32', source:'fmc16',
@@ -62,6 +63,21 @@ assert.strictEqual(s.acceptMatrix({...matrixPacket,frame_sequence:8,valid_column
   '192.168.100.50',4540).reason,'frame');
 assert.strictEqual(s.acceptMatrix({...matrixPacket,frame_sequence:8,columns:[1,2]},
   '192.168.100.50',4540).reason,'columns');
+const maintenancePacket={type:'jtag.maintenance',source:'stm32h743',state:'ready',
+  sequence:1,timestamp_ms:25,panel_control_ack:0x10203043,fpga_done:1};
+assert.strictEqual(validateJtagMaintenance(maintenancePacket,'192.168.100.50'),maintenancePacket);
+assert.strictEqual(s.acceptMaintenance(maintenancePacket,'192.168.100.50',4600).accepted,true);
+assert.strictEqual(s.snapshot(4600).systemState,'jtag-maintenance');
+assert.strictEqual(s.snapshot(4600).maintenance.fpga_done,1);
+assert.strictEqual(s.acceptMaintenance(maintenancePacket,'192.168.100.50',4700).reason,'duplicate');
+assert.strictEqual(s.accept({...packet(2,200),panel_control_ack:0x10203044},
+  '192.168.100.50',4800).accepted,true);
+assert.strictEqual(s.snapshot(4800).systemState,'normal');
+const maintenanceOnly=new TwinStore();
+assert.strictEqual(maintenanceOnly.acceptMaintenance(maintenancePacket,
+  '192.168.100.50',100).accepted,true);
+assert.strictEqual(maintenanceOnly.snapshot(100).online,true);
+assert.strictEqual(maintenanceOnly.snapshot(100).display.digits.join(''),'00000000');
 
 const frame=buildControlFrame(2,'down',0x12345678);
 assert.strictEqual(frame.length,16);
@@ -91,6 +107,21 @@ assert.strictEqual(modeFrame[7],0);
 assert.throws(()=>buildPanelControlFrame('mode',12,0,1),/mode/);
 assert.throws(()=>buildPanelControlFrame('mode',1,0,1),/mode/);
 assert.throws(()=>buildPanelControlFrame('mode',1,1,1),/mode/);
+const resetFrame=buildPanelControlFrame('reset',0,0xa5,0x10203042);
+assert.strictEqual(resetFrame[5],4);
+assert.strictEqual(resetFrame[6],0);
+assert.strictEqual(resetFrame[7],0xa5);
+assert.strictEqual(resetFrame.readUInt32BE(8),0x10203042);
+assert.strictEqual(resetFrame.readUInt16BE(14),crc16Ccitt(resetFrame,14));
+assert.throws(()=>buildPanelControlFrame('reset',1,0xa5,1),/index/);
+assert.throws(()=>buildPanelControlFrame('reset',0,0,1),/value/);
+const jtagEnterFrame=buildPanelControlFrame('jtag',0,0x5a,0x10203043);
+const jtagExitFrame=buildPanelControlFrame('jtag',0,0xa6,0x10203044);
+assert.strictEqual(jtagEnterFrame[5],5);
+assert.strictEqual(jtagEnterFrame[7],0x5a);
+assert.strictEqual(jtagExitFrame[5],5);
+assert.strictEqual(jtagExitFrame[7],0xa6);
+assert.throws(()=>buildPanelControlFrame('jtag',0,0,1),/value/);
 
 const sent=[];
 const q=new ControlQueue(value=>sent.push(Buffer.from(value)),()=>{},100);
@@ -112,6 +143,9 @@ assert.strictEqual(panelSent[0][5],2);
 assert.strictEqual(pq.acknowledge(200,2100),true);
 assert.strictEqual(pq.enqueue('mode',11,0,2200).target,'mode');
 assert.strictEqual(panelSent[1][5],3);
+assert.strictEqual(pq.acknowledge(pq.view().commandId,2300),true);
+assert.strictEqual(pq.enqueue('reset',0,0xa5,2400).target,'reset');
+assert.strictEqual(panelSent[2][5],4);
 const m11=matrixState.decodeM11(0xD4B08B7A);
 assert.strictEqual(m11.valid,true);
 assert.strictEqual(m11.running,true);

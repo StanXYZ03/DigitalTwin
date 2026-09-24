@@ -157,26 +157,152 @@ void FPGA_ExternalJtagRelease(void)
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
 
-  /* PE2/TCK, PE6/TDI and PE5/TDO must not load or drive the cable. */
+  /* Bridge schematic BR_J2/BR_J1A:
+   *   PC10 -> RV_TCK -> FPGA_TCK
+   *   PH6  -> RV_TMS -> FPGA_TMS
+   *   PC12 -> RV_TDI -> FPGA_TDI
+   *   PC11 <- RV_TDO <- FPGA_TDO
+   * These are direct 33-ohm branches, not the PE2/PE4/PE5/PE6 pins used by
+   * the configuration-flash path.  All four STM32 branches must therefore
+   * be electrically passive whenever an external Xilinx cable is used. */
+  gpio.Pin = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &gpio);
+
+  gpio.Pin = GPIO_PIN_6;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOH, &gpio);
+
+  /* Keep the separate QSPI/configuration branches passive as well. */
   gpio.Pin = GPIO_PIN_2 | GPIO_PIN_5 | GPIO_PIN_6;
   gpio.Mode = GPIO_MODE_ANALOG;
   gpio.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &gpio);
 
-  /* PE4 reaches TMS through BR_R45.  Use analog mode so even the STM32 input
-     buffer and internal pull resistor are disconnected from external JTAG. */
+  /* PE4 is retained as a passive legacy configuration branch. */
   gpio.Pin = GPIO_PIN_4;
   gpio.Mode = GPIO_MODE_ANALOG;
   gpio.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &gpio);
 
-  /* Retire the older PC6 push-pull TMS guard without adding another pull. */
+  /* PC6 is FMC_NWAIT on the bridge, not Xilinx TMS.  Retire the obsolete
+     push-pull guard without adding another load to that shared net. */
   gpio.Pin = GPIO_PIN_6;
   gpio.Mode = GPIO_MODE_ANALOG;
   gpio.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &gpio);
 
+  fpga_autoconfig_dbg.jtag_release_count++;
+  fpga_autoconfig_dbg.pc10_mode =
+      (GPIOC->MODER >> (10U * 2U)) & 0x3U;
+  fpga_autoconfig_dbg.pc11_mode =
+      (GPIOC->MODER >> (11U * 2U)) & 0x3U;
+  fpga_autoconfig_dbg.pc12_mode =
+      (GPIOC->MODER >> (12U * 2U)) & 0x3U;
+  fpga_autoconfig_dbg.ph6_mode =
+      (GPIOH->MODER >> (6U * 2U)) & 0x3U;
+
   FPGA_AutoConfig_SamplePins();
+}
+
+void FPGA_ExternalJtagFullIsolation(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+
+  /* Disconnect bridge mux and FMC cloud paths first.  Configure these pins
+     explicitly because maintenance mode is entered before MX_GPIO_Init(). */
+  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_7 | GPIO_PIN_8, GPIO_PIN_SET);
+  gpio.Pin = GPIO_PIN_7 | GPIO_PIN_8;
+  gpio.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOH, &gpio);
+
+  FPGA_ExternalJtagRelease();
+
+  /* PROGRAM_B has an external 4.7 kOhm pull-up at the FPGA.  Releasing the
+     STM32 branch keeps configuration inactive without actively fighting it. */
+  gpio.Pin = GPIO_PIN_3;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &gpio);
+
+  /* Release the auxiliary reset branch used by the bridge control header. */
+  gpio.Pin = GPIO_PIN_15;
+  gpio.Mode = GPIO_MODE_ANALOG;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &gpio);
+}
+
+#define FPGA_JTAG_MAINTENANCE_MAGIC  0x4A544147UL
+#define FPGA_JTAG_PRESERVE_MAGIC     0x50524553UL
+
+static volatile uint8_t fpga_jtag_maintenance_active;
+static volatile uint8_t fpga_jtag_preserve_boot_active;
+
+static void FPGA_JtagBackupAccessEnable(void)
+{
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTC_CLK_ENABLE();
+  __DSB();
+}
+
+void FPGA_JtagMaintenanceArm(void)
+{
+  FPGA_JtagBackupAccessEnable();
+  RTC->BKP31R = FPGA_JTAG_MAINTENANCE_MAGIC;
+  __DSB();
+}
+
+uint8_t FPGA_JtagMaintenanceConsumeRequest(void)
+{
+  FPGA_JtagBackupAccessEnable();
+  if (RTC->BKP31R != FPGA_JTAG_MAINTENANCE_MAGIC)
+  {
+    fpga_jtag_maintenance_active = 0U;
+    return 0U;
+  }
+  RTC->BKP31R = 0U;
+  __DSB();
+  fpga_jtag_maintenance_active = 1U;
+  return 1U;
+}
+
+uint8_t FPGA_JtagMaintenanceIsActive(void)
+{
+  return fpga_jtag_maintenance_active;
+}
+
+void FPGA_JtagPreserveOnNextBootArm(void)
+{
+  FPGA_JtagBackupAccessEnable();
+  RTC->BKP30R = FPGA_JTAG_PRESERVE_MAGIC;
+  __DSB();
+}
+
+uint8_t FPGA_JtagPreserveConsumeRequest(void)
+{
+  FPGA_JtagBackupAccessEnable();
+  if (RTC->BKP30R != FPGA_JTAG_PRESERVE_MAGIC)
+  {
+    fpga_jtag_preserve_boot_active = 0U;
+    return 0U;
+  }
+  RTC->BKP30R = 0U;
+  __DSB();
+  fpga_jtag_preserve_boot_active = 1U;
+  return 1U;
+}
+
+uint8_t FPGA_JtagPreserveBootIsActive(void)
+{
+  return fpga_jtag_preserve_boot_active;
 }
 
 static HAL_StatusTypeDef FPGA_WaitPin(GPIO_TypeDef *port,

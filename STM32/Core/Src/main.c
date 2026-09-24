@@ -78,6 +78,7 @@ static void CPU_CACHE_Enable(void);
   */
 int main(void)
 {
+  uint8_t jtag_maintenance_boot;
 
   /* USER CODE BEGIN 1 */
 
@@ -99,21 +100,39 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+  /* Read the one-shot request only after the complete RCC setup, but still
+     before GPIO/LCD initialization can touch PH6/Xilinx TMS. */
+  jtag_maintenance_boot = FPGA_JtagMaintenanceConsumeRequest();
+  (void)FPGA_JtagPreserveConsumeRequest();
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-#if (FPGA_EXTERNAL_JTAG_PASSIVE == 1U)
-  /* Release the bridge-connected Xilinx JTAG/configuration nets before any
-     peripheral or RTOS task can claim them. */
+  if (jtag_maintenance_boot != 0U)
+  {
+    /* Maintenance boot keeps only the Ethernet control plane.  LCD, FMC,
+       LTDC and all panel/monitor tasks remain uninitialized so PH6/TMS and
+       the bridge stay passive throughout external JTAG programming. */
+    FPGA_ExternalJtagFullIsolation();
+    MX_FREERTOS_Init();
+    osKernelStart();
+    Error_Handler();
+  }
+  /* Release the real bridge JTAG branches before any lengthy peripheral or
+     FPGA startup work.  This keeps external Vivado access available with the
+     bridge installed. */
   FPGA_ExternalJtagRelease();
-#endif
   /* This panel requires its command interface to be initialized before FMC,
      SDRAM and LTDC start.  FPGA configuration is retried later after the
      bridge supply has settled, so the proven LCD ordering can be retained. */
   LCD_RGB_InitPanelOnly();
+  /* LCD serial setup temporarily uses PH6 as T_PEN/CS.  PH6 is also the
+     bridge branch of Xilinx TMS, so release it immediately after the panel
+     register transaction completes. */
+  FPGA_ExternalJtagRelease();
   /* Keep bridge muxes isolated after LCD panel serial initialization. */
   HAL_GPIO_WritePin(GPIOH, GPIO_PIN_7|GPIO_PIN_8, GPIO_PIN_SET);
   MX_DMA_Init();
@@ -127,6 +146,9 @@ int main(void)
   {
     Error_Handler();
   }
+  /* Final ownership boundary: no normal runtime component may retain the
+     STM32-side Xilinx JTAG branches after all display GPIO setup is done. */
+  FPGA_ExternalJtagRelease();
 
   /* USER CODE END 2 */
 

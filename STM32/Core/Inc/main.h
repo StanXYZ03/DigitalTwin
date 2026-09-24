@@ -93,6 +93,15 @@ void Error_Handler(void);
  *     activity while retaining the proven Artix-7 configuration sequence. */
 #define FMC_BRIDGE_ISOLATION_DIAG  0U
 
+/* Temporary full isolation used to verify external Xilinx JTAG with the
+ * bridge installed.  This build deliberately skips FMC/network runtime. */
+#define FPGA_JTAG_FULL_ISOLATION_DIAG  0U
+
+/* The adapter labels PH6 as T_PEN/LCD serial CS, but the same net reaches
+ * Artix-7 TMS.  Test whether the panel's power-on defaults are sufficient so
+ * PH6 can remain permanently dedicated to external Xilinx JTAG. */
+#define LCD_PANEL_SERIAL_INIT_ENABLE   1U
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

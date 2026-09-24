@@ -119,15 +119,10 @@ void MX_GPIO_Init(void)
      both succeeded, and releases it on every error path. */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
 
-  /* Through the bridge PC6 reaches Xilinx TMS. Hold it HIGH during normal
-    operation so any coupled TCK activity cannot issue JTAG commands. */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
-
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOH, GPIO_PIN_6, GPIO_PIN_RESET);
   /* PH7 is the physical active-low enable for bridge muxes U4-U7. */
   HAL_GPIO_WritePin(GPIOH, GPIO_PIN_7|GPIO_PIN_8, GPIO_PIN_SET);
 
@@ -152,19 +147,18 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /* Bridge schematic: PE4 -> BR_R45 -> Artix-7 TMS.  Leave the STM32 branch
-     completely high impedance so the external Xilinx JTAG probe and the
-     board-level TMS pull-up are the only loads on this net.  PE4 is changed
-     to AF5/SPI4 only by the future MCU-JTAG service itself. */
+  /* Keep the unused PE4 configuration-side branch passive.  The real
+     Xilinx TMS branch is PH6 and is released below. */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PC6 (Xilinx TMS guard during bridge operation) */
+  /* PC6 is FMC_NWAIT on the bridge.  Asynchronous wait is disabled, so keep
+     this otherwise unused shared branch passive. */
   GPIO_InitStruct.Pin = GPIO_PIN_6;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -189,8 +183,16 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PH6 PH7 PH8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8;
+  /* PH6 is the STM32 branch of Xilinx TMS.  It must be high impedance from
+     the beginning of boot so an external JTAG cable can enumerate the FPGA
+     even while STM32 is still starting. */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PH7 PH8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_7|GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;

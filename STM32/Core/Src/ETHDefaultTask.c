@@ -27,7 +27,14 @@ extern struct netif gnetif;
 #define ETH_PANEL_TARGET_SWITCH   1U
 #define ETH_PANEL_TARGET_BUZZER   2U
 #define ETH_PANEL_TARGET_MODE     3U
+#define ETH_PANEL_TARGET_RESET    4U
+#define ETH_PANEL_TARGET_JTAG     5U
+#define ETH_RESET_CONFIRM_VALUE   0xA5U
+#define ETH_JTAG_CONFIRM_VALUE    0x5AU
+#define ETH_JTAG_EXIT_VALUE       0xA6U
+#define ETH_RESET_ACK_DELAY_MS    300U
 #define ETH_ENVIRONMENT_PERIOD_MS 1000U
+#define ETH_MAINTENANCE_PERIOD_MS 500U
 
 typedef struct
 {
@@ -49,6 +56,9 @@ typedef struct
     uint32_t control_duplicate_count;
     uint32_t control_reject_count;
     uint32_t last_control_id;
+    uint32_t remote_reset_request_count;
+    uint32_t remote_reset_execute_count;
+    uint32_t last_remote_reset_id;
     uint16_t last_control_crc;
     uint8_t last_control_key;
     uint8_t last_control_action;
@@ -60,6 +70,12 @@ typedef struct
 
 volatile ETH_TaskDebug eth_task_dbg;
 static volatile uint8_t network_stack_ready;
+static volatile uint8_t remote_reset_pending;
+static volatile uint32_t remote_reset_command_id;
+static volatile uint8_t remote_jtag_pending;
+static volatile uint32_t remote_jtag_command_id;
+static volatile uint8_t remote_jtag_exit_pending;
+static volatile uint32_t maintenance_control_ack;
 
 #if (FMC_BRIDGE_ISOLATION_DIAG == 1U)
 typedef struct
@@ -306,6 +322,15 @@ static void ETH_PollControl(int sock,
                      ((uint32_t)packet[9] << 16) |
                      ((uint32_t)packet[10] << 8) |
                      (uint32_t)packet[11];
+        if ((FPGA_JtagMaintenanceIsActive() != 0U) &&
+            ((is_panel == 0U) ||
+             (packet[5] != ETH_PANEL_TARGET_JTAG) ||
+             (packet[6] != 0U) ||
+             (packet[7] != ETH_JTAG_EXIT_VALUE)))
+        {
+            eth_task_dbg.control_reject_count++;
+            continue;
+        }
         if (is_key != 0U)
         {
             if ((packet[5] < 1U) || (packet[5] > 10U) ||
@@ -351,6 +376,49 @@ static void ETH_PollControl(int sock,
                  (packet[7] == 0U))
         {
             result = BoardPanel_SetMode(packet[6], command_id);
+        }
+        else if ((packet[5] == ETH_PANEL_TARGET_RESET) &&
+                 (packet[6] == 0U) &&
+                 (packet[7] == ETH_RESET_CONFIRM_VALUE))
+        {
+            result = BoardPanel_AcknowledgeSystemReset(command_id);
+            if (result == 0)
+            {
+                remote_reset_command_id = command_id;
+                remote_reset_pending = 1U;
+                eth_task_dbg.remote_reset_request_count++;
+                eth_task_dbg.last_remote_reset_id = command_id;
+            }
+        }
+        else if ((packet[5] == ETH_PANEL_TARGET_JTAG) &&
+                 (packet[6] == 0U) &&
+                 (((FPGA_JtagMaintenanceIsActive() == 0U) &&
+                   (packet[7] == ETH_JTAG_CONFIRM_VALUE)) ||
+                  ((FPGA_JtagMaintenanceIsActive() != 0U) &&
+                   (packet[7] == ETH_JTAG_EXIT_VALUE))))
+        {
+            if (FPGA_JtagMaintenanceIsActive() != 0U)
+            {
+                if (command_id == maintenance_control_ack)
+                {
+                    result = 1;
+                }
+                else
+                {
+                    maintenance_control_ack = command_id;
+                    remote_jtag_exit_pending = 1U;
+                    result = 0;
+                }
+            }
+            else
+            {
+                result = BoardPanel_AcknowledgeSystemReset(command_id);
+                if (result == 0)
+                {
+                    remote_jtag_command_id = command_id;
+                    remote_jtag_pending = 1U;
+                }
+            }
         }
         else
         {
@@ -580,6 +648,102 @@ static int ETH_SendEnvironment(int sock,
     return 0;
 }
 
+static void ETH_RunJtagMaintenance(void)
+{
+    int sock = -1;
+    int length;
+    int sent;
+    char payload[224];
+    struct sockaddr_in server_addr;
+    uint32_t sequence = 0U;
+    uint32_t next_publish_ms = 0U;
+    uint32_t now_ms;
+    osThreadId network_init_handle;
+
+    FPGA_ExternalJtagFullIsolation();
+    network_stack_ready = 0U;
+    maintenance_control_ack = 0U;
+    remote_jtag_exit_pending = 0U;
+    ETH_FillServerAddress(&server_addr);
+
+    osThreadDef(NetworkInitMaintenance, ETH_NetworkInitTask,
+                osPriorityBelowNormal, 0, 2048);
+    network_init_handle = osThreadCreate(osThread(NetworkInitMaintenance), NULL);
+    if (network_init_handle == NULL)
+    {
+        eth_task_dbg.last_errno = -1;
+    }
+
+    for (;;)
+    {
+        FPGA_ExternalJtagFullIsolation();
+        if (!ETH_WaitForNetwork())
+        {
+            osDelay(ETH_CONTROL_POLL_PERIOD_MS);
+            continue;
+        }
+
+        if (sock < 0)
+        {
+            sock = ETH_CreateUdpSocket();
+            if (sock < 0)
+            {
+                osDelay(ETH_CONTROL_POLL_PERIOD_MS);
+                continue;
+            }
+        }
+
+        ETH_PollControl(sock, &server_addr);
+        now_ms = HAL_GetTick();
+        if ((int32_t)(now_ms - next_publish_ms) < 0)
+        {
+            osDelay(ETH_CONTROL_POLL_PERIOD_MS);
+            continue;
+        }
+        next_publish_ms = now_ms + ETH_MAINTENANCE_PERIOD_MS;
+
+        length = snprintf(
+            payload, sizeof(payload),
+            "{\"type\":\"jtag.maintenance\",\"source\":\"stm32h743\","
+            "\"state\":\"ready\",\"sequence\":%lu,\"timestamp_ms\":%lu,"
+            "\"panel_control_ack\":%lu,\"fpga_done\":%u}",
+            (unsigned long)(++sequence),
+            (unsigned long)now_ms,
+            (unsigned long)maintenance_control_ack,
+            (unsigned int)((HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14) ==
+                            GPIO_PIN_SET) ? 1U : 0U));
+        if ((length <= 0) || ((size_t)length >= sizeof(payload)))
+        {
+            osDelay(ETH_CONTROL_POLL_PERIOD_MS);
+            continue;
+        }
+
+        sent = lwip_sendto(sock, payload, (size_t)length, 0,
+                           (const struct sockaddr *)&server_addr,
+                           sizeof(server_addr));
+        if (sent < 0)
+        {
+            eth_task_dbg.last_errno = errno;
+            lwip_close(sock);
+            sock = -1;
+            continue;
+        }
+        eth_task_dbg.send_count++;
+
+        /* The exit ACK has now reached the server.  A one-shot preserve flag
+           makes the following reset skip PROGRAM_B and retain the SRAM image
+           just downloaded through Xilinx JTAG. */
+        if (remote_jtag_exit_pending != 0U)
+        {
+            remote_jtag_exit_pending = 0U;
+            osDelay(ETH_RESET_ACK_DELAY_MS);
+            FPGA_JtagPreserveOnNextBootArm();
+            HAL_NVIC_SystemReset();
+            for (;;) { }
+        }
+    }
+}
+
 void ETHDefaultTask(void const *argument)
 {
     int sock = -1;
@@ -600,11 +764,30 @@ void ETHDefaultTask(void const *argument)
 
     (void)argument;
     eth_task_dbg.started = 1U;
+    remote_reset_pending = 0U;
+    remote_reset_command_id = 0U;
+    remote_jtag_pending = 0U;
+    remote_jtag_command_id = 0U;
+    remote_jtag_exit_pending = 0U;
+    maintenance_control_ack = 0U;
+
+    if (FPGA_JtagMaintenanceIsActive() != 0U)
+    {
+        ETH_RunJtagMaintenance();
+    }
 #if (FPGA_EXTERNAL_JTAG_PASSIVE == 1U)
     /* Hardware Manager owns JTAG/configuration in this build.  Do not pulse
        PROGRAM_B or enable the mode-selection mux behind its back. */
     FPGA_ExternalJtagRelease();
 #else
+    if (FPGA_JtagPreserveBootIsActive() != 0U)
+    {
+        /* Preserve the freshly downloaded SRAM design.  In particular, do
+           not pulse PROGRAM_B or force another Master-SPI configuration. */
+        FPGA_ExternalJtagRelease();
+    }
+    else
+    {
     /* The PI expander was initialized before the scheduler started while
        PROGRAM_B was held low.  Give the bridge rails time to settle, then
        perform one deterministic configuration release. */
@@ -613,6 +796,7 @@ void ETHDefaultTask(void const *argument)
 
     /* Once DONE is stable, disconnect all U4-U7 bridge muxes. */
     HAL_GPIO_WritePin(GPIOH, GPIO_PIN_7 | GPIO_PIN_8, GPIO_PIN_SET);
+    }
 #endif
     /* Normal runtime is passive on every branch shared with Xilinx JTAG.
        This permits direct external-JTAG access with the bridge installed. */
@@ -643,6 +827,11 @@ void ETHDefaultTask(void const *argument)
 
     for (;;)
     {
+        /* PH6 is reused as LCD panel CS only during early register setup.
+         * Continuously enforce passive ownership of the four direct JTAG
+         * branches so no later peripheral initialization can strand an
+         * already connected external Xilinx cable. */
+        FPGA_ExternalJtagRelease();
         FPGA_ConfigPins_Sample();
 
         if (sock >= 0)
@@ -771,6 +960,28 @@ void ETHDefaultTask(void const *argument)
         {
             eth_task_dbg.last_errno = 0;
             eth_task_dbg.send_count++;
+
+            /* The just-sent telemetry contains panel_control_ack.  Only now
+             * may the MCU reset, otherwise the server cannot distinguish an
+             * accepted reboot from a lost command. */
+            if ((remote_reset_pending != 0U) &&
+                (panel_snapshot.control_ack == remote_reset_command_id))
+            {
+                remote_reset_pending = 0U;
+                eth_task_dbg.remote_reset_execute_count++;
+                osDelay(ETH_RESET_ACK_DELAY_MS);
+                HAL_NVIC_SystemReset();
+                for (;;) { }
+            }
+            if ((remote_jtag_pending != 0U) &&
+                (panel_snapshot.control_ack == remote_jtag_command_id))
+            {
+                remote_jtag_pending = 0U;
+                osDelay(ETH_RESET_ACK_DELAY_MS);
+                FPGA_JtagMaintenanceArm();
+                HAL_NVIC_SystemReset();
+                for (;;) { }
+            }
             /* FMC/UDP keeps its 100 ms cadence, but a human-readable LCD
              * does not need to redraw the live counter on every packet. */
             if ((eth_task_dbg.send_count % 5U) == 0U)
